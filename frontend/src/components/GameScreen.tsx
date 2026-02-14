@@ -257,6 +257,48 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
           SCORE: 0
         </span>
       </div>
+
+      {/* Video area with tile lane lines */}
+      <div className="flex-1 relative bg-card flex items-center justify-center overflow-hidden min-h-0">
+        {loading && (
+          <span className="text-muted-foreground font-display text-sm tracking-widest animate-pulse">
+            Requesting camera access…
+          </span>
+        )}
+
+        {error && (
+          <div className="text-center max-w-sm px-4">
+            <p className="text-muted-foreground font-display text-sm tracking-wide">
+              {error}
+            </p>
+            <p className="text-muted-foreground/80 font-body text-xs mt-2">
+              Check site permissions or try another browser.
+            </p>
+          </div>
+        )}
+
+        {stream && !error && (
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            className="max-h-full max-w-full w-full h-full object-contain absolute inset-0 m-auto"
+            style={{ aspectRatio: "auto" }}
+          />
+        )}
+
+        {/* Lane divider lines */}
+        <div className="absolute inset-0 flex pointer-events-none">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <div
+              key={i}
+              className="flex-1 border-r border-foreground/10"
+            />
+          ))}
+          <div className="flex-1" />
+        </div>
+      </div>
     </div>
   );
 };
