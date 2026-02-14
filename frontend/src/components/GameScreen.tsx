@@ -13,43 +13,22 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [detectedGesture, setDetectedGesture] = useState<string>("");
+  const [activeLane, setActiveLane] = useState<number | null>(null);
   const handsRef = useRef<Hands | null>(null);
 
-  // Detect gesture based on hand landmarks
-  const detectGesture = (landmarks: any[]): string => {
-    if (!landmarks || landmarks.length === 0) return "";
+  // Detect which lane (1-4) the hand is in based on x-coordinate
+  const detectLane = (landmarks: any[]): number | null => {
+    if (!landmarks || landmarks.length === 0) return null;
 
-    // Simple finger counting gesture detection
+    // Use wrist position (landmark 0) to determine lane
     const handLandmarks = landmarks[0];
+    const wristX = handLandmarks[0].x; // x is normalized between 0 and 1
     
-    // Count extended fingers by comparing y-coordinates
-    let fingersUp = 0;
-    
-    // Thumb (compare x-coordinate for left/right hand)
-    if (Math.abs(handLandmarks[4].x - handLandmarks[3].x) > 0.05) fingersUp++;
-    
-    // Index finger
-    if (handLandmarks[8].y < handLandmarks[6].y) fingersUp++;
-    
-    // Middle finger
-    if (handLandmarks[12].y < handLandmarks[10].y) fingersUp++;
-    
-    // Ring finger
-    if (handLandmarks[16].y < handLandmarks[14].y) fingersUp++;
-    
-    // Pinky
-    if (handLandmarks[20].y < handLandmarks[18].y) fingersUp++;
-
-    // Detect specific gestures
-    if (fingersUp === 0) return "✊ Fist";
-    if (fingersUp === 1) return "☝️ One";
-    if (fingersUp === 2) return "✌️ Two";
-    if (fingersUp === 3) return "🤟 Three";
-    if (fingersUp === 4) return "🖖 Four";
-    if (fingersUp === 5) return "🖐️ Open Hand";
-    
-    return `${fingersUp} fingers`;
+    // Divide into 4 equal lanes
+    if (wristX < 0.25) return 1;
+    if (wristX < 0.5) return 2;
+    if (wristX < 0.75) return 3;
+    return 4;
   };
 
   // Initialize MediaPipe Hands
@@ -61,7 +40,7 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
     });
 
     hands.setOptions({
-      maxNumHands: 2,
+      maxNumHands: 1, // Only track one hand for lane detection
       modelComplexity: 1,
       minDetectionConfidence: 0.5,
       minTrackingConfidence: 0.5,
@@ -79,27 +58,27 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       // Draw hand landmarks and connections
-      if (results.multiHandLandmarks) {
-        for (const landmarks of results.multiHandLandmarks) {
-          // Draw connections (bones)
-          drawConnectors(ctx, landmarks, HAND_CONNECTIONS, {
-            color: "#00FF00",
-            lineWidth: 4,
-          });
-          
-          // Draw landmarks (joints)
-          drawLandmarks(ctx, landmarks, {
-            color: "#FF0000",
-            lineWidth: 2,
-            radius: 5,
-          });
-        }
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const landmarks = results.multiHandLandmarks[0];
+        
+        // Draw connections (bones)
+        drawConnectors(ctx, landmarks, HAND_CONNECTIONS, {
+          color: "#00FF00",
+          lineWidth: 4,
+        });
+        
+        // Draw landmarks (joints)
+        drawLandmarks(ctx, landmarks, {
+          color: "#FF0000",
+          lineWidth: 2,
+          radius: 5,
+        });
 
-        // Detect and display gesture
-        const gesture = detectGesture(results.multiHandLandmarks);
-        setDetectedGesture(gesture);
+        // Detect and set active lane
+        const lane = detectLane(results.multiHandLandmarks);
+        setActiveLane(lane);
       } else {
-        setDetectedGesture("");
+        setActiveLane(null);
       }
 
       ctx.restore();
@@ -174,38 +153,34 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
     if (!videoRef.current || !stream) return;
     videoRef.current.srcObject = stream;
 
-    // Set canvas size to match video
-    const handleLoadedMetadata = () => {
+    // Set canvas size to match video element's rendered dimensions
+    const updateCanvasSize = () => {
       if (videoRef.current && canvasRef.current) {
-        canvasRef.current.width = videoRef.current.videoWidth;
-        canvasRef.current.height = videoRef.current.videoHeight;
+        const rect = videoRef.current.getBoundingClientRect();
+        canvasRef.current.width = rect.width;
+        canvasRef.current.height = rect.height;
       }
     };
 
+    const handleLoadedMetadata = () => {
+      updateCanvasSize();
+    };
+
     videoRef.current.addEventListener("loadedmetadata", handleLoadedMetadata);
+    window.addEventListener("resize", updateCanvasSize);
 
     return () => {
       videoRef.current?.removeEventListener("loadedmetadata", handleLoadedMetadata);
+      window.removeEventListener("resize", updateCanvasSize);
     };
   }, [stream]);
 
   return (
-    <div className="flex flex-col h-screen bg-background overflow-hidden">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
-        <button
-          onClick={onBack}
-          className="font-display text-sm tracking-wider text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-        >
-          ← BACK
-        </button>
-        <span className="font-display text-sm tracking-wider text-muted-foreground">
-          SCORE: 0
-        </span>
-      </div>
-
-      {/* Video area with tile lane lines */}
-      <div className="flex-1 relative bg-card flex items-center justify-center overflow-hidden min-h-0">
+    <div className="relative h-screen w-screen bg-background overflow-hidden">
+      {/* Video area - CENTERED AND CONSTRAINED */}
+      <div className="absolute inset-0 bg-card flex items-center justify-center overflow-hidden">
+        {/* Video container with max dimensions */}
+        <div className="relative max-w-[75vw] max-h-[75vh] w-full h-full flex items-center justify-center">
         {loading && (
           <span className="text-muted-foreground font-display text-sm tracking-widest animate-pulse">
             Requesting camera access…
@@ -224,44 +199,63 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
         )}
 
         {stream && !error && (
-          <>
-            <video
-              ref={videoRef}
-              autoPlay
-              playsInline
-              muted
-              className="max-h-full max-w-full w-full h-full object-contain absolute inset-0 m-auto"
-              style={{ aspectRatio: "auto" }}
-            />
-            
-            {/* Canvas overlay for hand landmarks */}
-            <canvas
-              ref={canvasRef}
-              className="max-h-full max-w-full w-full h-full object-contain absolute inset-0 m-auto"
-              style={{ aspectRatio: "auto" }}
-            />
+          <div className="relative w-full h-full flex items-center justify-center">
+            <div className="relative">
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted
+                className="block max-w-full max-h-[75vh] object-contain"
+              />
+              
+              {/* Canvas overlay for hand landmarks */}
+              <canvas
+                ref={canvasRef}
+                className="absolute top-0 left-0 w-full h-full pointer-events-none"
+              />
 
-            {/* Gesture display */}
-            {detectedGesture && (
-              <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-black/70 px-6 py-3 rounded-lg backdrop-blur-sm">
-                <p className="text-white font-display text-lg tracking-wider">
-                  {detectedGesture}
-                </p>
+              {/* Lane divider lines with highlighting */}
+              <div className="absolute inset-0 flex pointer-events-none">
+                {Array.from({ length: 4 }).map((_, i) => (
+                  <div
+                    key={i}
+                    className={`flex-1 ${
+                      i < 3 ? "border-r" : ""
+                    } transition-all duration-200 ${
+                      activeLane === i + 1
+                        ? "bg-green-500/20 border-green-500"
+                        : "border-foreground/10"
+                    }`}
+                  />
+                ))}
               </div>
-            )}
-          </>
-        )}
 
-        {/* Lane divider lines */}
-        <div className="absolute inset-0 flex pointer-events-none">
-          {Array.from({ length: 3 }).map((_, i) => (
-            <div
-              key={i}
-              className="flex-1 border-r border-foreground/10"
-            />
-          ))}
-          <div className="flex-1" />
+              {/* Lane indicator display */}
+              {activeLane && (
+                <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-black/70 px-6 py-3 rounded-lg backdrop-blur-sm z-20">
+                  <p className="text-white font-display text-lg tracking-wider">
+                    LANE {activeLane}
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
         </div>
+      </div>
+
+      {/* Header overlay */}
+      <div className="absolute top-0 left-0 right-0 flex items-center justify-between px-4 py-3 bg-gradient-to-b from-black/60 to-transparent z-10">
+        <button
+          onClick={onBack}
+          className="font-display text-sm tracking-wider text-white/90 hover:text-white transition-colors cursor-pointer"
+        >
+          ← BACK
+        </button>
+        <span className="font-display text-sm tracking-wider text-white/90">
+          SCORE: 0
+        </span>
       </div>
     </div>
   );
