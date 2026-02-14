@@ -1,21 +1,26 @@
-from fastapi import APIRouter, HTTPException
-import httpx
+from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
+import io
 import os
-from typing import Optional
 from elevenlabs import ElevenLabs
 
-router = APIRouter(prefix="/elevenlabs", tags=["eleven"])
+router = APIRouter(prefix="/elevenlabs", tags=["elevenlabs"])
 
-ELEVENLABS_KEY = os.getenv("ELEVENLABS_KEY")
+ELEVENLABS_KEY = os.getenv("Eleven_Labs")
 
 client = ElevenLabs(
     api_key=ELEVENLABS_KEY,
 )
 
 @router.get("/generatemusic")
-async def generate_music_get(prompt: str, duration: int = 30):
-    music = client.music.compose(
+async def generate_music(prompt: str, duration: int = 3000):
+    audio_stream = client.music.compose(
         prompt=prompt,
-        music_length_ms=duration
-    )   
-    return await music
+        duration=duration,
+        output_format="mp3_22050_32"
+    )
+
+    return StreamingResponse(
+        audio_stream,
+        media_type="audio/mpeg"
+    )
