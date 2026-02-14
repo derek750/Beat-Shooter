@@ -16,7 +16,7 @@ client = ElevenLabs(
 async def generate_music(prompt: str, duration: int = 3000):
     audio_stream = client.music.compose(
         prompt=prompt,
-        duration=duration,
+        music_length_ms=duration,
         output_format="mp3_22050_32"
     )
 
