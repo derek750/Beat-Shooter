@@ -13,23 +13,8 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [activeLane, setActiveLane] = useState<number | null>(null);
+  const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
   const handsRef = useRef<Hands | null>(null);
-
-  // Detect which lane (1-4) the hand is in based on x-coordinate
-  const detectLane = (landmarks: any[]): number | null => {
-    if (!landmarks || landmarks.length === 0) return null;
-
-    // Use wrist position (landmark 0) to determine lane
-    const handLandmarks = landmarks[0];
-    const wristX = handLandmarks[0].x; // x is normalized between 0 and 1
-    
-    // Divide into 4 equal lanes
-    if (wristX < 0.25) return 1;
-    if (wristX < 0.5) return 2;
-    if (wristX < 0.75) return 3;
-    return 4;
-  };
 
   // Initialize MediaPipe Hands
   useEffect(() => {
@@ -74,11 +59,14 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
           radius: 5,
         });
 
-        // Detect and set active lane
-        const lane = detectLane(results.multiHandLandmarks);
-        setActiveLane(lane);
+        // Wrist (landmark 0) position; x inverted so hand-right = right on mirrored screen
+        const wrist = landmarks[0];
+        setPosition({
+          x: Math.round((1 - wrist.x) * canvas.width),
+          y: Math.round(wrist.y * canvas.height),
+        });
       } else {
-        setActiveLane(null);
+        setPosition(null);
       }
 
       ctx.restore();
@@ -176,90 +164,25 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
   }, [stream]);
 
   return (
-    <div className="relative h-screen w-screen bg-background overflow-hidden">
-      {/* Video area - CENTERED AND CONSTRAINED */}
-      <div className="absolute inset-0 bg-card flex items-center justify-center overflow-hidden">
-        {/* Video container with max dimensions */}
-        <div className="relative max-w-[75vw] max-h-[75vh] w-full h-full flex items-center justify-center">
-        {loading && (
-          <span className="text-muted-foreground font-display text-sm tracking-widest animate-pulse">
-            Requesting camera access…
-          </span>
-        )}
-
-        {error && (
-          <div className="text-center max-w-sm px-4">
-            <p className="text-muted-foreground font-display text-sm tracking-wide">
-              {error}
-            </p>
-            <p className="text-muted-foreground/80 font-body text-xs mt-2">
-              Check site permissions or try another browser.
-            </p>
-          </div>
-        )}
-
-        {stream && !error && (
-          <div className="relative w-full h-full flex items-center justify-center">
-            <div className="relative">
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                className="block max-w-full max-h-[75vh] object-contain"
-              />
-              
-              {/* Canvas overlay for hand landmarks */}
-              <canvas
-                ref={canvasRef}
-                className="absolute top-0 left-0 w-full h-full pointer-events-none"
-              />
-
-              {/* Lane divider lines with highlighting */}
-              <div className="absolute inset-0 flex pointer-events-none">
-                {Array.from({ length: 4 }).map((_, i) => (
-                  <div
-                    key={i}
-                    className={`flex-1 ${
-                      i < 3 ? "border-r" : ""
-                    } transition-all duration-200 ${
-                      activeLane === i + 1
-                        ? "bg-green-500/20 border-green-500"
-                        : "border-foreground/10"
-                    }`}
-                  />
-                ))}
-              </div>
-
-              {/* Lane indicator display */}
-              {activeLane && (
-                <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-black/70 px-6 py-3 rounded-lg backdrop-blur-sm z-20">
-                  <p className="text-white font-display text-lg tracking-wider">
-                    LANE {activeLane}
-                  </p>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-        </div>
-      </div>
-
-      {/* Header overlay */}
-      <div className="absolute top-0 left-0 right-0 flex items-center justify-between px-4 py-3 bg-gradient-to-b from-black/60 to-transparent z-10">
+    <div className="relative h-screen w-screen bg-background overflow-hidden flex flex-col">
+      {/* Top bar: no video, fixed height */}
+      <div className="flex-shrink-0 flex items-center justify-between px-4 py-3 bg-black/90 z-10">
         <button
           onClick={onBack}
           className="font-display text-sm tracking-wider text-white/90 hover:text-white transition-colors cursor-pointer"
         >
           ← BACK
         </button>
+        <span className="font-display text-sm tracking-wider text-white/70">
+          {position != null ? `X: ${position.x}  Y: ${position.y}` : "X: —  Y: —"}
+        </span>
         <span className="font-display text-sm tracking-wider text-white/90">
           SCORE: 0
         </span>
       </div>
 
-      {/* Video area with tile lane lines */}
-      <div className="flex-1 relative bg-card flex items-center justify-center overflow-hidden min-h-0">
+      {/* Video/canvas area only below the bar, mirrored so hand-right = right */}
+      <div className="flex-1 min-h-0 bg-card flex items-center justify-center overflow-hidden">
         {loading && (
           <span className="text-muted-foreground font-display text-sm tracking-widest animate-pulse">
             Requesting camera access…
@@ -278,26 +201,20 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
         )}
 
         {stream && !error && (
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
-            className="max-h-full max-w-full w-full h-full object-contain absolute inset-0 m-auto"
-            style={{ aspectRatio: "auto" }}
-          />
-        )}
-
-        {/* Lane divider lines */}
-        <div className="absolute inset-0 flex pointer-events-none">
-          {Array.from({ length: 3 }).map((_, i) => (
-            <div
-              key={i}
-              className="flex-1 border-r border-foreground/10"
+          <div className="relative w-full h-full" style={{ transform: "scaleX(-1)" }}>
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className="block w-full h-full object-cover"
             />
-          ))}
-          <div className="flex-1" />
-        </div>
+            <canvas
+              ref={canvasRef}
+              className="absolute top-0 left-0 w-full h-full pointer-events-none"
+            />
+          </div>
+        )}
       </div>
     </div>
   );
