@@ -1,8 +1,3 @@
-"""
-ESP32-WROOM32 serial connection and button state.
-Exposes a FastAPI router for /esp32/* endpoints.
-"""
-
 import json
 import re
 import threading

@@ -10,7 +10,6 @@ ELEVENLABS_KEY = os.getenv("ELEVENLABS_KEY")
 
 client = ElevenLabs(
     api_key=ELEVENLABS_KEY,
-    url="https://api.elevenlabs.io/"
 )
 
 @router.get("/generatemusic")
