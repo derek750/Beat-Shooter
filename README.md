@@ -1,5 +1,36 @@
 # Piano-Tiles
 
+## Python environment (.env)
+
+The backend loads configuration from a **`.env`** file in the project root.
+
+### Setup (for new clones)
+
+1. Copy the example file:
+   ```bash
+   cp .env.example .env
+   ```
+2. Edit `.env` and set any variables you need (see table below).
+3. `.env` is gitignored; never commit real secrets.
+
+The app loads `.env` automatically when you run `server.py` or `esp32_server.py` (via `python-dotenv`).
+
+### Environment variables
+
+| Variable | Required | Used by | Description |
+|----------|----------|---------|-------------|
+| `OPENWEATHER_API_KEY` | Only if using weather API | `server.py` → `/api/weather` | [OpenWeatherMap](https://openweathermap.org/api) API key. Get a free key at their site. Omit or leave empty if you don’t use the weather endpoint. |
+
+Optional variables (documented in `.env.example`; the app currently uses default host/port and CORS origins unless you add code to read these):
+
+- `HOST`, `PORT` — main API server (defaults: `0.0.0.0`, `8000`)
+- `ESP32_SERVER_PORT` — ESP32 server port (default: `8001`)
+- `CORS_ORIGINS` — allowed CORS origins (defaults: localhost:3000, localhost:5173)
+
+When adding new env vars, document them in `.env.example` (without real values) and in this table.
+
+---
+
 # ESP32 controller setup
 
 This project can use an **ESP32-WROOM32** (or compatible) board as a physical controller. The board connects over USB and sends button states to the ESP32 server.

@@ -3,6 +3,9 @@ FastAPI server for ESP32-WROOM32: connect over USB serial and retrieve button pr
 Run with: uvicorn esp32_server:app --host 0.0.0.0 --port 8001
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
