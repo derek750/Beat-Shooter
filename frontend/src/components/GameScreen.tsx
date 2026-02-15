@@ -18,6 +18,8 @@ const TILE_VISIBLE_DURATION = 4; // full opacity before fade out
 const ENERGY_RADIUS_SCALE = 0.6; // higher energy = up to 60% bigger
 const TILE_BASE_OPACITY = 0.82;
 const END_SCREEN_DELAY = 3; // seconds after last tile to show end screen
+const HIT_CONTACT_DURATION = 0.5; // seconds of contact needed to hit a tile
+const HIT_FADE_OUT_DURATION = 0.3; // quick fade when hit
 
 type Tile = { x: number; y: number };
 
@@ -32,7 +34,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const [countdown, setCountdown] = useState<number | null>(null);
     const [showEndScreen, setShowEndScreen] = useState(false);
-    const [score] = useState(0); // TODO: implement scoring logic
+    const [score, setScore] = useState(0);
     const tilesRef = useRef<Tile[]>([]);
     /** Seconds after audio start when each tile should appear (from beat map). */
     const tileDisplayTimesRef = useRef<number[]>([]);
@@ -40,6 +42,12 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const beatTypesRef = useRef<string[]>([]);
     /** Energy values per beat (for circle size scaling), same length as timestamps. */
     const energiesRef = useRef<number[]>([]);
+    /** Track which tiles have been hit */
+    const tileHitStatesRef = useRef<boolean[]>([]);
+    /** Track when contact started with each tile (null if no contact) */
+    const tileContactStartRef = useRef<(number | null)[]>([]);
+    /** Track when each tile was hit (for fade out animation) */
+    const tileHitTimesRef = useRef<(number | null)[]>([]);
     const countdownRef = useRef<number | null>(null);
     const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const gameStartTimeRef = useRef<number | null>(null);
@@ -51,10 +59,14 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         if (!audioUrl) {
             setCountdown(null);
             setShowEndScreen(false);
+            setScore(0);
             tilesRef.current = [];
             tileDisplayTimesRef.current = [];
             beatTypesRef.current = [];
             energiesRef.current = [];
+            tileHitStatesRef.current = [];
+            tileContactStartRef.current = [];
+            tileHitTimesRef.current = [];
             gameEndTimeRef.current = null;
             return;
         }
@@ -104,6 +116,11 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 beatTimestamps.length > 0
                     ? [...beatTimestamps]
                     : Array.from({ length: count }, (_, i) => i * 0.5);
+
+            // Initialize hit tracking arrays
+            tileHitStatesRef.current = new Array(tiles.length).fill(false);
+            tileContactStartRef.current = new Array(tiles.length).fill(null);
+            tileHitTimesRef.current = new Array(tiles.length).fill(null);
 
             // Calculate when game should end (last tile + all durations + delay)
             if (tileDisplayTimesRef.current.length > 0) {
@@ -180,6 +197,28 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
             const { width: w, height: h } = canvas;
+            
+            // Get hand bounding box if hand is detected
+            let handBox: { left: number; top: number; right: number; bottom: number } | null = null;
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                let minX = 1, maxX = 0, minY = 1, maxY = 0;
+                for (const lm of landmarks) {
+                    const x = 1 - lm.x; // Inverted for mirrored display
+                    minX = Math.min(minX, x);
+                    maxX = Math.max(maxX, x);
+                    minY = Math.min(minY, lm.y);
+                    maxY = Math.max(maxY, lm.y);
+                }
+                const pad = 0.03;
+                handBox = {
+                    left: (minX - pad) * w,
+                    top: (minY - pad) * h,
+                    right: (maxX + pad) * w,
+                    bottom: (maxY + pad) * h,
+                };
+            }
+
             if (countdownRef.current === 0 && tilesRef.current.length > 0 && gameStartTimeRef.current != null) {
                 const elapsed = (performance.now() - gameStartTimeRef.current) / 1000;
                 
@@ -199,27 +238,78 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 const minE = energies.length > 0 ? Math.min(...energies) : 0;
                 const maxE = energies.length > 0 ? Math.max(...energies) : 1;
                 const energyRange = maxE - minE || 1;
+                
                 for (let i = 0; i < tiles.length; i++) {
                     const displayAt = times[i] ?? 0;
                     if (elapsed < displayAt) continue;
-                    const fadeOutStart = displayAt + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION;
-                    if (elapsed >= fadeOutStart + TILE_FADE_OUT_DURATION) continue; // done, don't draw
-                    let opacity: number;
-                    if (elapsed < displayAt + TILE_FADE_IN_DURATION) {
-                        const fadeProgress = (elapsed - displayAt) / TILE_FADE_IN_DURATION;
-                        opacity = TILE_BASE_OPACITY * fadeProgress;
-                    } else if (elapsed >= fadeOutStart) {
-                        const fadeOutProgress = (elapsed - fadeOutStart) / TILE_FADE_OUT_DURATION;
-                        opacity = TILE_BASE_OPACITY * (1 - Math.min(1, fadeOutProgress));
-                    } else {
-                        opacity = TILE_BASE_OPACITY;
-                    }
-                    const cx = (1 - tiles[i].x) * w;
-                    const cy = tiles[i].y * h;
-
+                    
                     const energyNorm = energies[i] != null ? (energies[i] - minE) / energyRange : 0.5;
                     const radius = TILE_RADIUS * (1 + energyNorm * ENERGY_RADIUS_SCALE);
-
+                    const cx = (1 - tiles[i].x) * w;
+                    const cy = tiles[i].y * h;
+                    
+                    // Check collision with hand if tile is visible and not yet hit
+                    if (!tileHitStatesRef.current[i] && handBox) {
+                        const tileLeft = cx - radius;
+                        const tileRight = cx + radius;
+                        const tileTop = cy - radius;
+                        const tileBottom = cy + radius;
+                        
+                        // Check if hand box overlaps with tile circle (using bounding box collision)
+                        const isColliding = !(
+                            handBox.right < tileLeft ||
+                            handBox.left > tileRight ||
+                            handBox.bottom < tileTop ||
+                            handBox.top > tileBottom
+                        );
+                        
+                        if (isColliding) {
+                            // Start or continue contact
+                            if (tileContactStartRef.current[i] === null) {
+                                tileContactStartRef.current[i] = elapsed;
+                            } else {
+                                // Check if contact duration met
+                                const contactDuration = elapsed - tileContactStartRef.current[i];
+                                if (contactDuration >= HIT_CONTACT_DURATION) {
+                                    tileHitStatesRef.current[i] = true;
+                                    tileHitTimesRef.current[i] = elapsed;
+                                    tileContactStartRef.current[i] = null;
+                                    setScore(prev => prev + 1);
+                                }
+                            }
+                        } else {
+                            // No collision, reset contact
+                            tileContactStartRef.current[i] = null;
+                        }
+                    }
+                    
+                    // Calculate opacity based on hit state or normal lifecycle
+                    let opacity: number;
+                    const isHit = tileHitStatesRef.current[i];
+                    
+                    if (isHit) {
+                        // Hit tile - fade out quickly
+                        const hitTime = tileHitTimesRef.current[i] ?? elapsed;
+                        const timeSinceHit = elapsed - hitTime;
+                        if (timeSinceHit >= HIT_FADE_OUT_DURATION) continue; // Don't draw
+                        const fadeProgress = timeSinceHit / HIT_FADE_OUT_DURATION;
+                        opacity = TILE_BASE_OPACITY * (1 - fadeProgress);
+                    } else {
+                        // Normal lifecycle
+                        const fadeOutStart = displayAt + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION;
+                        if (elapsed >= fadeOutStart + TILE_FADE_OUT_DURATION) continue; // done, don't draw
+                        
+                        if (elapsed < displayAt + TILE_FADE_IN_DURATION) {
+                            const fadeProgress = (elapsed - displayAt) / TILE_FADE_IN_DURATION;
+                            opacity = TILE_BASE_OPACITY * fadeProgress;
+                        } else if (elapsed >= fadeOutStart) {
+                            const fadeOutProgress = (elapsed - fadeOutStart) / TILE_FADE_OUT_DURATION;
+                            opacity = TILE_BASE_OPACITY * (1 - Math.min(1, fadeOutProgress));
+                        } else {
+                            opacity = TILE_BASE_OPACITY;
+                        }
+                    }
+                    
                     const isHigh = beatTypes[i] === "high";
                     const fillColor = isHigh ? "rgba(239, 68, 68, 0.88)" : "rgba(99, 102, 241, 0.88)";
 
@@ -237,30 +327,13 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
             }
 
             // Draw bounding box around hand
-            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-                const landmarks = results.multiHandLandmarks[0];
-                const { width: w, height: h } = canvas;
-
-                // Bounding box from landmarks (x inverted for mirrored display)
-                let minX = 1, maxX = 0, minY = 1, maxY = 0;
-                for (const lm of landmarks) {
-                    const x = 1 - lm.x;
-                    minX = Math.min(minX, x);
-                    maxX = Math.max(maxX, x);
-                    minY = Math.min(minY, lm.y);
-                    maxY = Math.max(maxY, lm.y);
-                }
-                const pad = 0.03;
-                const left = (minX - pad) * w;
-                const top = (minY - pad) * h;
-                const boxW = (maxX - minX + pad * 2) * w;
-                const boxH = (maxY - minY + pad * 2) * h;
-
+            if (handBox) {
                 ctx.strokeStyle = "#00FF00";
                 ctx.lineWidth = 4;
-                ctx.strokeRect(w - left - boxW, top, boxW, boxH);
+                ctx.strokeRect(handBox.left, handBox.top, handBox.right - handBox.left, handBox.bottom - handBox.top);
 
                 // Wrist (landmark 0) position
+                const landmarks = results.multiHandLandmarks![0];
                 const wrist = landmarks[0];
                 setPosition({
                     x: Math.round((1 - wrist.x) * w),
