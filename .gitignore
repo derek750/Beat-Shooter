@@ -4,3 +4,5 @@ env
 .env
 node_modules
 songs
+__pycache__/
+*.py[cod]
