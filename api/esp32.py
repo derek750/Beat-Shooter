@@ -49,39 +49,108 @@ _broadcaster_started = False
 _broadcaster_lock = threading.Lock()
 
 
-def _parse_line(line: str) -> Optional[tuple[list[int] | None, float | None, float | None]]:
+def _parse_line(line: str) -> Optional[dict]:
     """
-    Parse a line from ESP32 into (button_states, pitch_deg, roll_deg). Any can be None.
+    Parse a line from ESP32 into one of:
+      - {"kind":"state", "buttons":[0,1,...], "pitch":float|None, "roll":float|None}
+      - {"kind":"event", "type":"PRESS"/"RELEASE", "button":int, "pitch":float|None, "roll":float|None}
 
-    Accepts either:
-    - JSON: {"buttons":[0,1,0], "pitch": 12.3, "roll": -4.5}
-    - Raw: "0101" or "0 1 0 1" (extracts 0/1 chars)
+    Supported payloads (newline-delimited):
+      1) JSON state:
+         {"buttons":[0,1,0], "pitch": 12.3, "roll": -4.5}
+      2) JSON event:
+         {"type":"PRESS","button":0}   or   {"event":"PRESS","button":0}
+      3) Text event:
+         "PRESS 0" / "RELEASE 0" / "P0" / "R0"
+      4) Text state:
+         "0101" or "0 1 0 1"
+      5) Pulse lines (common when ESP prints only on press):
+         "1" => treated as PRESS on button 0 (see PULSE_* settings below)
     """
     line = line.strip()
     if not line:
         return None
 
-    # JSON
-    if line.startswith("{"):
-        try:
-            data = json.loads(line)
-            buttons = None
-            b = data.get("buttons") or data.get("b")
-            if isinstance(b, list):
-                buttons = [1 if x else 0 for x in b]
+    # Treat lone "1" as a press pulse by default (ESP often prints just "1" on press)
+    PULSE_MODE = True
+    PULSE_BUTTON_INDEX = 0
 
-            pitch = data.get("pitch")
-            roll = data.get("roll")
-            pitch_deg = float(pitch) if pitch is not None else None
-            roll_deg = float(roll) if roll is not None else None
-            return (buttons, pitch_deg, roll_deg)
+    def _as_float(x):
+        try:
+            return float(x)
         except Exception:
             return None
 
-    # Non-JSON: extract any 0/1 chars
-    parts = re.findall(r"[01]", line)
-    if parts:
-        return ([int(p) for p in parts], None, None)
+    # ----------------------------
+    # JSON
+    # ----------------------------
+    if line.startswith("{"):
+        try:
+            data = json.loads(line)
+        except Exception:
+            return None
+
+        pitch = _as_float(data.get("pitch"))
+        roll = _as_float(data.get("roll"))
+
+        # Event form
+        et = data.get("type") or data.get("event") or data.get("e")
+        btn = data.get("button") if "button" in data else data.get("btn")
+        if isinstance(et, str) and str(et).upper() in {"PRESS", "RELEASE"} and btn is not None:
+            try:
+                b = int(btn)
+            except Exception:
+                return None
+            return {"kind": "event", "type": str(et).upper(), "button": b, "pitch": pitch, "roll": roll}
+
+        # State form
+        b = data.get("buttons") or data.get("b")
+        if isinstance(b, list):
+            buttons = [1 if x else 0 for x in b]
+            return {"kind": "state", "buttons": buttons, "pitch": pitch, "roll": roll}
+
+        return None
+
+    upper = line.upper()
+
+    # ----------------------------
+    # Text event: "PRESS 0", "RELEASE 1", "P0", "R2"
+    # ----------------------------
+    m = re.search(r"\b(PRESS|RELEASE)\b\D*(\d+)", upper)
+    if m:
+        return {"kind": "event", "type": m.group(1), "button": int(m.group(2)), "pitch": None, "roll": None}
+
+    m = re.fullmatch(r"([PR])\s*(\d+)", upper)
+    if m:
+        return {
+            "kind": "event",
+            "type": "PRESS" if m.group(1) == "P" else "RELEASE",
+            "button": int(m.group(2)),
+            "pitch": None,
+            "roll": None,
+        }
+
+    # ----------------------------
+    # Single-bit line: "0" or "1"
+    # ----------------------------
+    if re.fullmatch(r"[01]", line):
+        if PULSE_MODE and line == "1":
+            return {"kind": "event", "type": "PRESS", "button": PULSE_BUTTON_INDEX, "pitch": None, "roll": None}
+        return {"kind": "state", "buttons": [int(line)], "pitch": None, "roll": None}
+
+    # ----------------------------
+    # Compact binary: "0101"
+    # ----------------------------
+    if re.fullmatch(r"[01]{2,}", line):
+        return {"kind": "state", "buttons": [int(c) for c in line], "pitch": None, "roll": None}
+
+    # ----------------------------
+    # Spaced / messy: extract bits
+    # ----------------------------
+    bits = re.findall(r"[01]", line)
+    if bits:
+        # If ESP prints "1" somewhere in a log line, treat as pulse only when it's the whole payload (above).
+        return {"kind": "state", "buttons": [int(b) for b in bits], "pitch": None, "roll": None}
 
     return None
 
@@ -138,15 +207,44 @@ def _reader_thread() -> None:
             if parsed is None:
                 continue
 
-            buttons, pitch_deg, roll_deg = parsed
+            # ----------------------------
+            # Event packets: immediate PRESS/RELEASE
+            # ----------------------------
+            if parsed.get("kind") == "event":
+                kind = parsed.get("type")
+                idx = parsed.get("button")
+                if kind in {"PRESS", "RELEASE"} and isinstance(idx, int):
+                    _emit_button_change(kind, idx)
+                # optional pitch/roll piggyback
+                pitch_deg = parsed.get("pitch")
+                roll_deg = parsed.get("roll")
+                if pitch_deg is not None or roll_deg is not None:
+                    with _accel_lock:
+                        if pitch_deg is not None:
+                            _pitch = float(pitch_deg)
+                        if roll_deg is not None:
+                            _roll = float(roll_deg)
+                continue
 
-            if buttons is not None:
+            # ----------------------------
+            # State packets: update + edge detect
+            # ----------------------------
+            buttons = parsed.get("buttons") if parsed.get("kind") == "state" else None
+            pitch_deg = parsed.get("pitch")
+            roll_deg = parsed.get("roll")
+
+            if isinstance(buttons, list):
+                # Normalize to 0/1 ints
+                buttons = [1 if int(v) else 0 for v in buttons]
+
                 with _buttons_lock:
                     _buttons = buttons
 
-                # edge detect
-                for i, v in enumerate(buttons):
+                # edge detect (handle length changes safely)
+                max_len = max(len(prev), len(buttons))
+                for i in range(max_len):
                     p = prev[i] if i < len(prev) else 0
+                    v = buttons[i] if i < len(buttons) else 0
                     if v != p:
                         _emit_button_change("PRESS" if v else "RELEASE", i)
 
@@ -155,9 +253,9 @@ def _reader_thread() -> None:
             if pitch_deg is not None or roll_deg is not None:
                 with _accel_lock:
                     if pitch_deg is not None:
-                        _pitch = pitch_deg
+                        _pitch = float(pitch_deg)
                     if roll_deg is not None:
-                        _roll = roll_deg
+                        _roll = float(roll_deg)
 
         except (serial.SerialException, OSError):
             break
@@ -229,15 +327,8 @@ async def ws_events(websocket: WebSocket):
 
     # Start broadcaster task ONCE (now that we are in an async event loop)
     _ensure_broadcaster_started()
-    # Only the first connected client will actually start the task.
-    # If task already started, creating another would be wasteful, so guard:
-    # We'll detect by checking if queue consumer is running via a private flag.
-    # Simplest: start it when first client connects and ignore subsequent.
-    # We do that here by using another guard with the same lock.
     start_task = False
     with _broadcaster_lock:
-        # if started flag is true we still don't know if task launched;
-        # launch exactly once by attaching an attribute on router.
         if not getattr(router, "_ws_broadcast_task_started", False):
             setattr(router, "_ws_broadcast_task_started", True)
             start_task = True
@@ -259,8 +350,7 @@ async def ws_events(websocket: WebSocket):
         pass
 
     try:
-        # We don't require client messages.
-        # Just keep the socket open until disconnect.
+        # Client may send keepalive pings (frontend does).
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
@@ -293,15 +383,17 @@ def connect(body: ConnectBody):
 
     with _serial_lock:
         if _serial_conn is not None and _serial_conn.is_open:
-            return {"success": False, "detail": f"Already connected to {_connected_port}. Disconnect first."}
+            return {"success": True, "detail": "Already connected", "port": _connected_port, "baud_rate": _baud_rate}
 
+        _baud_rate = body.baud_rate
         try:
             conn = serial.Serial(
-                port=CONSTANT_PORT,
-                baudrate=body.baud_rate,
-                timeout=0.1,
+                CONSTANT_PORT,
+                body.baud_rate,
+                timeout=1,
+                write_timeout=1,
             )
-            # clear stale bytes
+            # clear buffers after connect (helps after reset / stale bytes)
             try:
                 conn.reset_input_buffer()
                 conn.reset_output_buffer()
@@ -310,15 +402,15 @@ def connect(body: ConnectBody):
 
             _serial_conn = conn
             _connected_port = CONSTANT_PORT
-            _baud_rate = body.baud_rate
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to connect: {e}")
 
-        except serial.SerialException as e:
-            raise HTTPException(status_code=400, detail=str(e))
+    # start reader thread
+    if _reader is None or not _reader.is_alive():
+        _reader = threading.Thread(target=_reader_thread, daemon=True)
+        _reader.start()
 
-    _reader = threading.Thread(target=_reader_thread, daemon=True)
-    _reader.start()
-
-    return {"success": True, "port": CONSTANT_PORT, "baud_rate": body.baud_rate}
+    return {"success": True, "detail": "Connected", "port": CONSTANT_PORT, "baud_rate": body.baud_rate}
 
 
 @router.post("/disconnect")
