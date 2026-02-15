@@ -12,6 +12,7 @@ decorator==5.2.1
 distro==1.9.0
 elevenlabs==2.35.0
 fastapi==0.129.0
+opencv-python-headless>=4.8.0
 google-ai-generativelanguage==0.6.15
 google-api-core==2.25.2
 google-api-python-client==2.190.0

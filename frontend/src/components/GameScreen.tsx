@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { Hands, Results } from "@mediapipe/hands";
 
 interface GameScreenProps {
     audioUrl?: string;
@@ -7,7 +6,6 @@ interface GameScreenProps {
 }
 
 const API_BASE = "http://localhost:8000";
-const WS_BASE = API_BASE.replace(/^http/, "ws");
 const TILE_RADIUS = 70;
 /** Tiles within this many before/after cannot overlap (passed to API). */
 const TILE_WINDOW = 6;
@@ -22,6 +20,13 @@ const END_SCREEN_DELAY = 3; // seconds after last tile to show end screen
 
 type Tile = { x: number; y: number };
 
+interface CVResult {
+    center: [number, number];
+    bbox: [number, number, number, number];
+    projected_point?: [number, number];
+    rotation_angle?: number;
+}
+
 const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const videoRef = useRef<HTMLVideoElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -29,14 +34,13 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const [error, setError] = useState<string | null>(null);
     const [loading, setLoading] = useState(true);
     const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
-    const handsRef = useRef<Hands | null>(null);
+    const cvResultRef = useRef<CVResult | null>(null);
+    const lastTrackTimeRef = useRef<number>(0);
+    const TRACK_INTERVAL_MS = 66; // ~15 fps
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const [countdown, setCountdown] = useState<number | null>(null);
     const [showEndScreen, setShowEndScreen] = useState(false);
     const [score] = useState(0); // TODO: implement scoring logic
-    /** Latest ESP32 button event from WebSocket (PRESS/RELEASE + button index). Consumed by game logic. */
-    const [esp32ButtonEvent, setEsp32ButtonEvent] = useState<{ type: "PRESS" | "RELEASE"; button: number } | null>(null);
-    const wsRef = useRef<WebSocket | null>(null);
     const tilesRef = useRef<Tile[]>([]);
     /** Seconds after audio start when each tile should appear (from beat map). */
     const tileDisplayTimesRef = useRef<number[]>([]);
@@ -48,6 +52,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const gameStartTimeRef = useRef<number | null>(null);
     const gameEndTimeRef = useRef<number | null>(null);
+    const endScreenShownRef = useRef(false);
     countdownRef.current = countdown;
 
     // Before countdown: fetch tiles + placeholder API, then 5-second countdown
@@ -60,6 +65,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
             beatTypesRef.current = [];
             energiesRef.current = [];
             gameEndTimeRef.current = null;
+            endScreenShownRef.current = false;
             return;
         }
 
@@ -68,44 +74,6 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         const runBeforeCountdown = async () => {
             const width = window.innerWidth;
             const height = window.innerHeight - 60;
-
-            // Connect to ESP32 before we use the WebSocket for button events
-            try {
-                const connectRes = await fetch(`${API_BASE}/esp32/connect`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ port: "/dev/cu.ESP32_Controller", baud_rate: 115200 }),
-                });
-                const connectData = (await connectRes.json()) as { success?: boolean };
-                if (!connectData.success) {
-                    console.warn("ESP32 connect failed or already connected:", await connectRes.text());
-                }
-            } catch (e) {
-                console.warn("ESP32 connect error:", e);
-            }
-            if (cancelled) return;
-
-            // Open WebSocket for ESP32 button events (only after connect)
-            const wsUrl = `${WS_BASE}/esp32/ws`;
-            const ws = new WebSocket(wsUrl);
-            wsRef.current = ws;
-            ws.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data) as { type?: string; button?: number };
-                    if (data?.type !== "PRESS" && data?.type !== "RELEASE") return;
-                    const buttonIndex = typeof data.button === "number" ? data.button : 0;
-                    if (buttonIndex !== 0 && buttonIndex !== 1) return;
-                    if (data.type === "PRESS") {
-                        console.log(`Button [${buttonIndex}] clicked`);
-                    }
-                    setEsp32ButtonEvent({ type: data.type as "PRESS" | "RELEASE", button: buttonIndex });
-                } catch {
-                    // ignore parse errors
-                }
-            };
-            ws.onclose = () => {
-                wsRef.current = null;
-            };
 
             const beatMapRes = await fetch(`${API_BASE}/beats/create_beats`, {
                 method: "POST",
@@ -173,10 +141,6 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
 
         return () => {
             cancelled = true;
-            if (wsRef.current) {
-                wsRef.current.close();
-                wsRef.current = null;
-            }
             if (countdownIntervalRef.current) {
                 clearInterval(countdownIntervalRef.current);
                 countdownIntervalRef.current = null;
@@ -188,6 +152,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         if (!audioUrl || countdown !== 0) return;
         gameStartTimeRef.current = performance.now();
         setShowEndScreen(false);
+        endScreenShownRef.current = false;
         const audio = new Audio(audioUrl);
         audio.loop = false;
         audioRef.current = audio;
@@ -199,40 +164,29 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         };
     }, [audioUrl, countdown]);
 
-    // Initialize MediaPipe Hands
+    // Draw loop: tiles + CV bbox + crosshair at projected point
     useEffect(() => {
-        const hands = new Hands({
-            locateFile: (file) => {
-                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
-            },
-        });
+        if (!canvasRef.current || !stream) return;
 
-        hands.setOptions({
-            maxNumHands: 1, // Only track one hand for lane detection
-            modelComplexity: 1,
-            minDetectionConfidence: 0.5,
-            minTrackingConfidence: 0.5,
-        });
+        let animationFrame: number;
+        const canvas = canvasRef.current;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
 
-        hands.onResults((results: Results) => {
+        const draw = () => {
             if (!canvasRef.current) return;
+            const c = canvasRef.current;
+            const w = c.width;
+            const h = c.height;
+            ctx.clearRect(0, 0, w, h);
 
-            const canvas = canvasRef.current;
-            const ctx = canvas.getContext("2d");
-            if (!ctx) return;
-
-            // Clear canvas
-            ctx.save();
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-            const { width: w, height: h } = canvas;
             if (countdownRef.current === 0 && tilesRef.current.length > 0 && gameStartTimeRef.current != null) {
                 const elapsed = (performance.now() - gameStartTimeRef.current) / 1000;
-                
+
                 // Check if game should end
-                if (gameEndTimeRef.current != null && elapsed >= gameEndTimeRef.current && !showEndScreen) {
+                if (gameEndTimeRef.current != null && elapsed >= gameEndTimeRef.current && !endScreenShownRef.current) {
+                    endScreenShownRef.current = true;
                     setShowEndScreen(true);
-                    // Stop audio
                     if (audioRef.current) {
                         audioRef.current.pause();
                     }
@@ -249,7 +203,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     const displayAt = times[i] ?? 0;
                     if (elapsed < displayAt) continue;
                     const fadeOutStart = displayAt + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION;
-                    if (elapsed >= fadeOutStart + TILE_FADE_OUT_DURATION) continue; // done, don't draw
+                    if (elapsed >= fadeOutStart + TILE_FADE_OUT_DURATION) continue;
                     let opacity: number;
                     if (elapsed < displayAt + TILE_FADE_IN_DURATION) {
                         const fadeProgress = (elapsed - displayAt) / TILE_FADE_IN_DURATION;
@@ -262,13 +216,10 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     }
                     const cx = (1 - tiles[i].x) * w;
                     const cy = tiles[i].y * h;
-
                     const energyNorm = energies[i] != null ? (energies[i] - minE) / energyRange : 0.5;
                     const radius = TILE_RADIUS * (1 + energyNorm * ENERGY_RADIUS_SCALE);
-
                     const isHigh = beatTypes[i] === "high";
                     const fillColor = isHigh ? "rgba(239, 68, 68, 0.88)" : "rgba(99, 102, 241, 0.88)";
-
                     ctx.save();
                     ctx.globalAlpha = opacity;
                     ctx.fillStyle = fillColor;
@@ -282,69 +233,149 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 }
             }
 
-            // Draw bounding box around hand
-            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-                const landmarks = results.multiHandLandmarks[0];
-                const { width: w, height: h } = canvas;
-
-                // Bounding box from landmarks (x inverted for mirrored display)
-                let minX = 1, maxX = 0, minY = 1, maxY = 0;
-                for (const lm of landmarks) {
-                    const x = 1 - lm.x;
-                    minX = Math.min(minX, x);
-                    maxX = Math.max(maxX, x);
-                    minY = Math.min(minY, lm.y);
-                    maxY = Math.max(maxY, lm.y);
-                }
-                const pad = 0.03;
-                const left = (minX - pad) * w;
-                const top = (minY - pad) * h;
-                const boxW = (maxX - minX + pad * 2) * w;
-                const boxH = (maxY - minY + pad * 2) * h;
-
+            const cvResult = cvResultRef.current;
+            if (cvResult) {
+                const [bx, by, bw, bh] = cvResult.bbox;
+                // Invert bbox x coordinate
+                const invBx = w - bx - bw;
                 ctx.strokeStyle = "#00FF00";
                 ctx.lineWidth = 4;
-                ctx.strokeRect(w - left - boxW, top, boxW, boxH);
+                ctx.strokeRect(invBx, by, bw, bh);
 
-                // Wrist (landmark 0) position
-                const wrist = landmarks[0];
-                setPosition({
-                    x: Math.round((1 - wrist.x) * w),
-                    y: Math.round(wrist.y * h),
-                });
-            } else {
-                setPosition(null);
+                // Draw crosshair at projected point if available
+                if (cvResult.projected_point) {
+                    const [px, py] = cvResult.projected_point;
+                    // Invert x-coordinate to match the mirrored video display
+                    const invPx = w - px;
+                    const crosshairSize = 20;
+                    const lineWidth = 2;
+
+                    ctx.strokeStyle = "#FF00FF";
+                    ctx.lineWidth = lineWidth;
+                    ctx.globalAlpha = 0.8;
+
+                    // Horizontal line
+                    ctx.beginPath();
+                    ctx.moveTo(invPx - crosshairSize, py);
+                    ctx.lineTo(invPx + crosshairSize, py);
+                    ctx.stroke();
+
+                    // Vertical line
+                    ctx.beginPath();
+                    ctx.moveTo(invPx, py - crosshairSize);
+                    ctx.lineTo(invPx, py + crosshairSize);
+                    ctx.stroke();
+
+                    // Center circle
+                    ctx.fillStyle = "#FF00FF";
+                    ctx.globalAlpha = 0.6;
+                    ctx.beginPath();
+                    ctx.arc(invPx, py, 4, 0, Math.PI * 2);
+                    ctx.fill();
+                }
             }
 
-            ctx.restore();
-        });
+            animationFrame = requestAnimationFrame(draw);
+        };
 
-        handsRef.current = hands;
+        draw();
 
         return () => {
-            hands.close();
+            if (animationFrame) cancelAnimationFrame(animationFrame);
         };
-    }, [showEndScreen]);
+    }, [stream]);
 
-    // Process video frames
+    // Capture video frames and send to CV API for colour tracking
     useEffect(() => {
-        if (!videoRef.current || !handsRef.current || !stream) return;
+        if (!videoRef.current || !stream || !canvasRef.current) return;
 
-        let animationFrame: number;
+        const video = videoRef.current;
+        const captureCanvas = document.createElement("canvas");
+        let cancelled = false;
 
-        const detectHands = async () => {
-            if (videoRef.current && videoRef.current.readyState === 4) {
-                await handsRef.current!.send({ image: videoRef.current });
+        const tick = async () => {
+            if (cancelled || !videoRef.current || !canvasRef.current) return;
+            const now = performance.now();
+            if (now - lastTrackTimeRef.current < TRACK_INTERVAL_MS) {
+                setTimeout(tick, TRACK_INTERVAL_MS - (now - lastTrackTimeRef.current));
+                return;
             }
-            animationFrame = requestAnimationFrame(detectHands);
+            if (video.readyState < 2) {
+                setTimeout(tick, 50);
+                return;
+            }
+
+            const w = canvasRef.current.width;
+            const h = canvasRef.current.height;
+            const vw = video.videoWidth;
+            const vh = video.videoHeight;
+            captureCanvas.width = vw;
+            captureCanvas.height = vh;
+            const capCtx = captureCanvas.getContext("2d");
+            if (!capCtx) {
+                setTimeout(tick, TRACK_INTERVAL_MS);
+                return;
+            }
+            capCtx.drawImage(video, 0, 0);
+            const dataUrl = captureCanvas.toDataURL("image/jpeg", 0.85);
+
+            lastTrackTimeRef.current = now;
+            try {
+                const res = await fetch(`${API_BASE}/cv/track`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ image: dataUrl }),
+                });
+                if (cancelled) return;
+                const data = (await res.json()) as {
+                    found: boolean;
+                    center: [number, number] | null;
+                    bbox: [number, number, number, number] | null;
+                    projected_point?: [number, number] | null;
+                    rotation_angle?: number | null;
+                };
+                if (data.found && data.center && data.bbox) {
+                    const [cx, cy] = data.center;
+                    const [bx, by, bw, bh] = data.bbox;
+                    const scaleX = w / vw;
+                    const scaleY = h / vh;
+                    const dispCx = cx * scaleX;
+                    const dispCy = cy * scaleY;
+                    const dispBx = bx * scaleX;
+                    const dispBy = by * scaleY;
+                    const dispBw = bw * scaleX;
+                    const dispBh = bh * scaleY;
+
+                    let projPoint: [number, number] | undefined;
+                    if (data.projected_point) {
+                        const [ppx, ppy] = data.projected_point;
+                        projPoint = [ppx * scaleX, ppy * scaleY];
+                    }
+
+                    setPosition({ x: Math.round(w - dispCx), y: Math.round(dispCy) });
+                    cvResultRef.current = {
+                        center: [w - dispCx, dispCy],
+                        bbox: [w - dispBx - dispBw, dispBy, dispBw, dispBh],
+                        projected_point: projPoint,
+                        rotation_angle: data.rotation_angle ?? undefined,
+                    };
+                } else {
+                    setPosition(null);
+                    cvResultRef.current = null;
+                }
+            } catch {
+                if (!cancelled) {
+                    setPosition(null);
+                    cvResultRef.current = null;
+                }
+            }
+            setTimeout(tick, TRACK_INTERVAL_MS);
         };
 
-        detectHands();
+        tick();
 
         return () => {
-            if (animationFrame) {
-                cancelAnimationFrame(animationFrame);
-            }
+            cancelled = true;
         };
     }, [stream]);
 
@@ -422,11 +453,6 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 </button>
                 <span className="font-display text-sm tracking-wider text-white/70">
                     {position != null ? `X: ${position.x}  Y: ${position.y}` : "X: —  Y: —"}
-                    {esp32ButtonEvent != null && (
-                        <span className="ml-3 text-emerald-400">
-                            ESP32: {esp32ButtonEvent.type} {esp32ButtonEvent.button}
-                        </span>
-                    )}
                 </span>
                 <span className="font-display text-sm tracking-wider text-white/90">
                     SCORE: {score}
