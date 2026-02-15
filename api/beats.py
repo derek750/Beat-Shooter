@@ -29,91 +29,115 @@ def _url_to_local_path(audio_url: str) -> str:
     return local
 
 
-@router.post("/create_beats")
-def create_beats(body: CreateBeatsBody, debug: bool = False):
-    """Analyze audio and return beat map as arrays (timestamps in seconds, types)."""
-    mp3_path = _url_to_local_path(body.audio_url)
-    y, sr = librosa.load(mp3_path)
-    duration = librosa.get_duration(y=y, sr=sr)
-    
-    if debug:
-        print(f"\nAudio loaded: {duration:.2f} seconds, Sample rate: {sr}")
-    
-    # Compute RMS energy
-    hop_length = 512
-    rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
-    times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop_length)
-    
-    if debug:
-        print(f"RMS frames: {len(rms)}")
-        print(f"RMS mean: {np.mean(rms):.4f}, max: {np.max(rms):.4f}, min: {np.min(rms):.4f}")
-    
-    # Detect onset strength (beat energy)
+def _create_beats_beat_track(y: np.ndarray, sr: int, duration: float, hop_length: int, debug: bool) -> list:
+    """
+    Tempo-aware beat detection via librosa.beat.beat_track.
+    Uses dynamic programming to pick beats consistent with estimated tempo;
+    more musically coherent than raw onset peaks.
+    """
     onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
-    
+    tempo, beat_frames = librosa.beat.beat_track(
+        onset_envelope=onset_env,
+        sr=sr,
+        hop_length=hop_length,
+        units="time",
+    )
+    # beat_track returns (tempo, beats); beats may be 1d array or 2d (bpm, beats)
+    beat_times = np.atleast_1d(beat_frames)
+    if beat_times.ndim > 1:
+        beat_times = beat_times.flatten()
+    beat_times = beat_times[beat_times >= 0]  # filter sentinel values
+    beat_times = np.sort(beat_times)
+
     if debug:
-        print(f"Onset strength mean: {np.mean(onset_env):.4f}, max: {np.max(onset_env):.4f}")
-    
-    # Find peaks in onset strength (potential drops)
-    threshold = np.percentile(onset_env, 85)  # Top 15% of energy
-    peaks, properties = find_peaks(onset_env, height=threshold, distance=sr//hop_length*2)
-    
-    if debug:
-        print(f"Threshold used: {threshold:.4f}")
-        print(f"Peaks found: {len(peaks)}")
-    
-    # Combined list to store all points of interest
+        bpm = float(np.median(tempo)) if np.size(tempo) else float(tempo)
+        print(f"Beat track: tempo ~{bpm:.1f} BPM, {len(beat_times)} beats")
+
+    times = librosa.frames_to_time(np.arange(len(onset_env)), sr=sr, hop_length=hop_length)
     all_points = []
-    
-    # Find low points before each peak and add both to the list
-    search_window = int(4 * sr / hop_length)  # Look back 4 seconds max
-    
+    for t in beat_times:
+        # Sample onset strength at this beat (interpolate if needed)
+        idx = np.searchsorted(times, t, side="left")
+        idx = min(idx, len(onset_env) - 1)
+        energy = float(onset_env[idx])
+        all_points.append({"time": float(t), "type": "beat", "frame": idx, "energy": energy})
+
+    # Classify as high (downbeat / strong) vs low (upbeat / weak) by onset strength
+    if len(all_points) > 0:
+        energies = [p["energy"] for p in all_points]
+        median_e = float(np.median(energies))
+        for p in all_points:
+            p["type"] = "high" if p["energy"] >= median_e else "low"
+
+    return all_points
+
+
+def _create_beats_onset_peaks(
+    y: np.ndarray, sr: int, duration: float, hop_length: int, debug: bool
+) -> list:
+    """
+    Original onset-peak method: peaks in onset strength + low points before peaks.
+    Good for bass-drop style detection; less tempo-coherent than beat_track.
+    """
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+    threshold = np.percentile(onset_env, 85)
+    peaks, _ = find_peaks(onset_env, height=threshold, distance=sr // hop_length * 2)
+    search_window = int(4 * sr / hop_length)
+    all_points = []
     for peak in peaks:
-        if peak > 10:  # Need some frames to look back
-            # Define search range
+        if peak > 10:
             start_idx = max(0, peak - search_window)
-            
-            # Find the minimum in the window before this peak
             search_region = onset_env[start_idx:peak]
             if len(search_region) > 0:
-                min_idx_relative = np.argmin(search_region)
-                min_idx_absolute = start_idx + min_idx_relative
-                
-                # Add low point
+                min_idx_absolute = start_idx + int(np.argmin(search_region))
                 low_time = librosa.frames_to_time(min_idx_absolute, sr=sr, hop_length=hop_length)
                 all_points.append({
-                    'time': low_time,
-                    'type': 'low',
-                    'frame': min_idx_absolute,
-                    'energy': onset_env[min_idx_absolute]
+                    "time": float(low_time),
+                    "type": "low",
+                    "frame": min_idx_absolute,
+                    "energy": float(onset_env[min_idx_absolute]),
                 })
-        
-        # Add high point (peak/drop)
         peak_time = librosa.frames_to_time(peak, sr=sr, hop_length=hop_length)
         all_points.append({
-            'time': peak_time,
-            'type': 'high',
-            'frame': peak,
-            'energy': onset_env[peak]
+            "time": float(peak_time),
+            "type": "high",
+            "frame": int(peak),
+            "energy": float(onset_env[peak]),
         })
-    
-    # Sort all points by time
-    all_points.sort(key=lambda x: float(x["time"]))
+    all_points.sort(key=lambda x: x["time"])
+    return all_points
+
+
+@router.post("/create_beats")
+def create_beats(body: CreateBeatsBody, debug: bool = False, method: str = "beat_track"):
+    """
+    Analyze audio and return beat map as arrays (timestamps in seconds, types).
+
+    method: "beat_track" (default) - tempo-aware beat grid, more musically accurate.
+            "onset_peaks" - original peak-based detection, good for bass drops.
+    """
+    mp3_path = _url_to_local_path(body.audio_url)
+    y, sr = librosa.load(mp3_path)
+    duration = float(librosa.get_duration(y=y, sr=sr))
+    hop_length = 512
+
+    if debug:
+        print(f"\nAudio loaded: {duration:.2f} seconds, Sample rate: {sr}, method={method}")
+
+    if method == "onset_peaks":
+        all_points = _create_beats_onset_peaks(y, sr, duration, hop_length, debug)
+    else:
+        all_points = _create_beats_beat_track(y, sr, duration, hop_length, debug)
 
     if debug:
         print(f"\nTotal points of interest: {len(all_points)}")
-        print("\n=== All Points of Interest (chronological) ===")
-        for i, point in enumerate(all_points):
+        for i, point in enumerate(all_points[:20]):
             print(f"  {i+1}. {float(point['time']):6.2f}s - {point['type'].upper():4s} (energy: {float(point['energy']):.4f})")
+        if len(all_points) > 20:
+            print(f"  ... and {len(all_points) - 20} more")
 
-    # Ensure all values are JSON-serializable (no numpy scalars)
     all_points_json = [
-        {
-            "time": float(p["time"]),
-            "type": str(p["type"]),
-            "frame": int(p["frame"]),
-            "energy": float(p["energy"]),
-        }
+        {"time": float(p["time"]), "type": str(p["type"]), "frame": int(p["frame"]), "energy": float(p["energy"])}
         for p in all_points
     ]
     timestamps = [p["time"] for p in all_points_json]
