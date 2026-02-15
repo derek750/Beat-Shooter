@@ -19,6 +19,10 @@ _baud_rate: int = 115200
 _buttons: list[int] = []
 _buttons_lock = threading.Lock()
 
+_pitch: float = 0.0
+_roll: float = 0.0
+_accel_lock = threading.Lock()
+
 _max_events = 100
 _events: list[dict] = []
 _events_lock = threading.Lock()
@@ -26,23 +30,29 @@ _events_lock = threading.Lock()
 _reader: Optional[threading.Thread] = None
 
 
-def _parse_line(line: str) -> Optional[list[int]]:
-    """Parse a line from ESP32 into a list of button states (0 or 1)."""
+def _parse_line(line: str) -> Optional[tuple[list[int] | None, float | None, float | None]]:
+    """Parse a line from ESP32 into (button_states, pitch_deg, roll_deg). Any can be None."""
     line = line.strip()
     if not line:
         return None
     if line.startswith("{"):
         try:
             data = json.loads(line)
+            buttons = None
             b = data.get("buttons") or data.get("b")
             if b is not None and isinstance(b, list):
-                return [1 if x else 0 for x in b]
-        except json.JSONDecodeError:
+                buttons = [1 if x else 0 for x in b]
+            pitch = data.get("pitch")
+            roll = data.get("roll")
+            pitch_deg = float(pitch) if pitch is not None else None
+            roll_deg = float(roll) if roll is not None else None
+            return (buttons, pitch_deg, roll_deg)
+        except (json.JSONDecodeError, TypeError, ValueError):
             pass
         return None
     parts = re.findall(r"[01]", line)
     if parts:
-        return [int(p) for p in parts]
+        return ([int(p) for p in parts], None, None)
     return None
 
 
@@ -54,7 +64,7 @@ def _emit_event(kind: str, index: int) -> None:
 
 
 def _reader_thread() -> None:
-    global _buttons
+    global _buttons, _pitch, _roll
     prev: list[int] = []
     while True:
         conn = None
@@ -72,13 +82,21 @@ def _reader_thread() -> None:
                 continue
             parsed = _parse_line(text)
             if parsed is not None:
-                with _buttons_lock:
-                    _buttons = parsed
-                for i, v in enumerate(parsed):
-                    p = prev[i] if i < len(prev) else 0
-                    if v != p:
-                        _emit_event("PRESS" if v else "RELEASE", i)
-                prev = parsed
+                buttons, pitch_deg, roll_deg = parsed
+                if buttons is not None:
+                    with _buttons_lock:
+                        _buttons = buttons
+                    for i, v in enumerate(buttons):
+                        p = prev[i] if i < len(prev) else 0
+                        if v != p:
+                            _emit_event("PRESS" if v else "RELEASE", i)
+                    prev = buttons
+                if pitch_deg is not None or roll_deg is not None:
+                    with _accel_lock:
+                        if pitch_deg is not None:
+                            _pitch = pitch_deg
+                        if roll_deg is not None:
+                            _roll = roll_deg
         except (serial.SerialException, OSError):
             break
         except Exception:
@@ -167,6 +185,7 @@ def get_buttons():
     return {"buttons": buttons, "count": len(buttons)}
 
 
+
 @router.get("/events")
 def get_events(clear: bool = False):
     """Recent button press/release events. Use clear=true to consume and clear."""
@@ -175,3 +194,12 @@ def get_events(clear: bool = False):
         if clear:
             _events.clear()
     return {"events": out}
+
+
+@router.get("/accelerometer")
+def get_accelerometer():
+    """Current orientation from accelerometer: pitch and roll in degrees (tilt)."""
+    with _accel_lock:
+        pitch = _pitch
+        roll = _roll
+    return {"pitch": pitch, "roll": roll}
