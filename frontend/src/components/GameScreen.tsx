@@ -85,6 +85,13 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         let cancelled = false;
 
         const runBeforeCountdown = async () => {
+
+            const espRes = await fetch(`${API_BASE}/esp32/connect`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ port:  "/dev/cu.ESP32_Controller", baudrate: 115200}),
+            });
+
             const width = window.innerWidth;
             const height = window.innerHeight - 60;
 
