@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from api import beats, health, esp32, elevenlabs, songs, gemini, tiles, cv
+from api import beats, health, esp32, elevenlabs, songs, gemini, tiles
 
 app = FastAPI(title="API Proxy Server")
 
@@ -24,7 +24,6 @@ app.include_router(songs.router)
 app.include_router(tiles.router)
 app.include_router(beats.router)
 app.include_router(gemini.router)
-app.include_router(cv.router)
 
 app.mount("/songs/files", StaticFiles(directory="songs"), name="songs-files")
 
