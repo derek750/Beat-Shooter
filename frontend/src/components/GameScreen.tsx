@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Hands, Results } from "@mediapipe/hands";
 
 interface GameScreenProps {
     audioUrl?: string;
@@ -16,15 +17,11 @@ const TILE_FADE_OUT_DURATION = 0.4; // constant time to fade out
 const TILE_VISIBLE_DURATION = 4; // full opacity before fade out
 const ENERGY_RADIUS_SCALE = 0.6; // higher energy = up to 60% bigger
 const TILE_BASE_OPACITY = 0.82;
+const END_SCREEN_DELAY = 3; // seconds after last tile to show end screen
+const HIT_CONTACT_DURATION = 0.5; // seconds of contact needed to hit a tile
+const HIT_FADE_OUT_DURATION = 0.3; // quick fade when hit
 
 type Tile = { x: number; y: number };
-
-interface CVResult {
-    center: [number, number];
-    bbox: [number, number, number, number];
-    projected_point?: [number, number];
-    rotation_angle?: number;
-}
 
 const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const videoRef = useRef<HTMLVideoElement>(null);
@@ -33,11 +30,11 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const [error, setError] = useState<string | null>(null);
     const [loading, setLoading] = useState(true);
     const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
-    const cvResultRef = useRef<CVResult | null>(null);
-    const lastTrackTimeRef = useRef<number>(0);
-    const TRACK_INTERVAL_MS = 66; // ~15 fps
+    const handsRef = useRef<Hands | null>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const [countdown, setCountdown] = useState<number | null>(null);
+    const [showEndScreen, setShowEndScreen] = useState(false);
+    const [score, setScore] = useState(0);
     const tilesRef = useRef<Tile[]>([]);
     /** Seconds after audio start when each tile should appear (from beat map). */
     const tileDisplayTimesRef = useRef<number[]>([]);
@@ -45,19 +42,32 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const beatTypesRef = useRef<string[]>([]);
     /** Energy values per beat (for circle size scaling), same length as timestamps. */
     const energiesRef = useRef<number[]>([]);
+    /** Track which tiles have been hit */
+    const tileHitStatesRef = useRef<boolean[]>([]);
+    /** Track when contact started with each tile (null if no contact) */
+    const tileContactStartRef = useRef<(number | null)[]>([]);
+    /** Track when each tile was hit (for fade out animation) */
+    const tileHitTimesRef = useRef<(number | null)[]>([]);
     const countdownRef = useRef<number | null>(null);
     const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const gameStartTimeRef = useRef<number | null>(null);
+    const gameEndTimeRef = useRef<number | null>(null);
     countdownRef.current = countdown;
 
     // Before countdown: fetch tiles + placeholder API, then 5-second countdown
     useEffect(() => {
         if (!audioUrl) {
             setCountdown(null);
+            setShowEndScreen(false);
+            setScore(0);
             tilesRef.current = [];
             tileDisplayTimesRef.current = [];
             beatTypesRef.current = [];
             energiesRef.current = [];
+            tileHitStatesRef.current = [];
+            tileContactStartRef.current = [];
+            tileHitTimesRef.current = [];
+            gameEndTimeRef.current = null;
             return;
         }
 
@@ -107,6 +117,18 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     ? [...beatTimestamps]
                     : Array.from({ length: count }, (_, i) => i * 0.5);
 
+            // Initialize hit tracking arrays
+            tileHitStatesRef.current = new Array(tiles.length).fill(false);
+            tileContactStartRef.current = new Array(tiles.length).fill(null);
+            tileHitTimesRef.current = new Array(tiles.length).fill(null);
+
+            // Calculate when game should end (last tile + all durations + delay)
+            if (tileDisplayTimesRef.current.length > 0) {
+                const lastTileTime = Math.max(...tileDisplayTimesRef.current);
+                const lastTileEndTime = lastTileTime + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION + TILE_FADE_OUT_DURATION;
+                gameEndTimeRef.current = lastTileEndTime + END_SCREEN_DELAY;
+            }
+
             if (cancelled) return;
             setCountdown(5);
             const interval = setInterval(() => {
@@ -136,8 +158,9 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     useEffect(() => {
         if (!audioUrl || countdown !== 0) return;
         gameStartTimeRef.current = performance.now();
+        setShowEndScreen(false);
         const audio = new Audio(audioUrl);
-        audio.loop = true;
+        audio.loop = false;
         audioRef.current = audio;
         audio.play().catch((err) => console.warn("Audio autoplay failed:", err));
         return () => {
@@ -147,24 +170,67 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         };
     }, [audioUrl, countdown]);
 
-    // Draw loop: tiles + CV bbox + crosshair at projected point
+    // Initialize MediaPipe Hands
     useEffect(() => {
-        if (!canvasRef.current || !stream) return;
+        const hands = new Hands({
+            locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            },
+        });
 
-        let animationFrame: number;
-        const canvas = canvasRef.current;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return;
+        hands.setOptions({
+            maxNumHands: 1, // Only track one hand for lane detection
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5,
+        });
 
-        const draw = () => {
+        hands.onResults((results: Results) => {
             if (!canvasRef.current) return;
-            const c = canvasRef.current;
-            const w = c.width;
-            const h = c.height;
-            ctx.clearRect(0, 0, w, h);
+
+            const canvas = canvasRef.current;
+            const ctx = canvas.getContext("2d");
+            if (!ctx) return;
+
+            // Clear canvas
+            ctx.save();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            const { width: w, height: h } = canvas;
+            
+            // Get hand bounding box if hand is detected
+            let handBox: { left: number; top: number; right: number; bottom: number } | null = null;
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                let minX = 1, maxX = 0, minY = 1, maxY = 0;
+                for (const lm of landmarks) {
+                    const x = 1 - lm.x; // Inverted for mirrored display
+                    minX = Math.min(minX, x);
+                    maxX = Math.max(maxX, x);
+                    minY = Math.min(minY, lm.y);
+                    maxY = Math.max(maxY, lm.y);
+                }
+                const pad = 0.03;
+                handBox = {
+                    left: (minX - pad) * w,
+                    top: (minY - pad) * h,
+                    right: (maxX + pad) * w,
+                    bottom: (maxY + pad) * h,
+                };
+            }
 
             if (countdownRef.current === 0 && tilesRef.current.length > 0 && gameStartTimeRef.current != null) {
                 const elapsed = (performance.now() - gameStartTimeRef.current) / 1000;
+                
+                // Check if game should end
+                if (gameEndTimeRef.current != null && elapsed >= gameEndTimeRef.current && !showEndScreen) {
+                    setShowEndScreen(true);
+                    // Stop audio
+                    if (audioRef.current) {
+                        audioRef.current.pause();
+                    }
+                }
+
                 const times = tileDisplayTimesRef.current;
                 const tiles = tilesRef.current;
                 const beatTypes = beatTypesRef.current;
@@ -172,27 +238,81 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 const minE = energies.length > 0 ? Math.min(...energies) : 0;
                 const maxE = energies.length > 0 ? Math.max(...energies) : 1;
                 const energyRange = maxE - minE || 1;
+                
                 for (let i = 0; i < tiles.length; i++) {
                     const displayAt = times[i] ?? 0;
                     if (elapsed < displayAt) continue;
-                    const fadeOutStart = displayAt + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION;
-                    if (elapsed >= fadeOutStart + TILE_FADE_OUT_DURATION) continue;
-                    let opacity: number;
-                    if (elapsed < displayAt + TILE_FADE_IN_DURATION) {
-                        const fadeProgress = (elapsed - displayAt) / TILE_FADE_IN_DURATION;
-                        opacity = TILE_BASE_OPACITY * fadeProgress;
-                    } else if (elapsed >= fadeOutStart) {
-                        const fadeOutProgress = (elapsed - fadeOutStart) / TILE_FADE_OUT_DURATION;
-                        opacity = TILE_BASE_OPACITY * (1 - Math.min(1, fadeOutProgress));
-                    } else {
-                        opacity = TILE_BASE_OPACITY;
-                    }
-                    const cx = (1 - tiles[i].x) * w;
-                    const cy = tiles[i].y * h;
+                    
                     const energyNorm = energies[i] != null ? (energies[i] - minE) / energyRange : 0.5;
                     const radius = TILE_RADIUS * (1 + energyNorm * ENERGY_RADIUS_SCALE);
+                    const cx = (1 - tiles[i].x) * w;
+                    const cy = tiles[i].y * h;
+                    
+                    // Check collision with hand if tile is visible and not yet hit
+                    if (!tileHitStatesRef.current[i] && handBox) {
+                        const tileLeft = cx - radius;
+                        const tileRight = cx + radius;
+                        const tileTop = cy - radius;
+                        const tileBottom = cy + radius;
+                        
+                        // Check if hand box overlaps with tile circle (using bounding box collision)
+                        const isColliding = !(
+                            handBox.right < tileLeft ||
+                            handBox.left > tileRight ||
+                            handBox.bottom < tileTop ||
+                            handBox.top > tileBottom
+                        );
+                        
+                        if (isColliding) {
+                            // Start or continue contact
+                            if (tileContactStartRef.current[i] === null) {
+                                tileContactStartRef.current[i] = elapsed;
+                            } else {
+                                // Check if contact duration met
+                                const contactDuration = elapsed - tileContactStartRef.current[i];
+                                if (contactDuration >= HIT_CONTACT_DURATION) {
+                                    tileHitStatesRef.current[i] = true;
+                                    tileHitTimesRef.current[i] = elapsed;
+                                    tileContactStartRef.current[i] = null;
+                                    setScore(prev => prev + 1);
+                                }
+                            }
+                        } else {
+                            // No collision, reset contact
+                            tileContactStartRef.current[i] = null;
+                        }
+                    }
+                    
+                    // Calculate opacity based on hit state or normal lifecycle
+                    let opacity: number;
+                    const isHit = tileHitStatesRef.current[i];
+                    
+                    if (isHit) {
+                        // Hit tile - fade out quickly
+                        const hitTime = tileHitTimesRef.current[i] ?? elapsed;
+                        const timeSinceHit = elapsed - hitTime;
+                        if (timeSinceHit >= HIT_FADE_OUT_DURATION) continue; // Don't draw
+                        const fadeProgress = timeSinceHit / HIT_FADE_OUT_DURATION;
+                        opacity = TILE_BASE_OPACITY * (1 - fadeProgress);
+                    } else {
+                        // Normal lifecycle
+                        const fadeOutStart = displayAt + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION;
+                        if (elapsed >= fadeOutStart + TILE_FADE_OUT_DURATION) continue; // done, don't draw
+                        
+                        if (elapsed < displayAt + TILE_FADE_IN_DURATION) {
+                            const fadeProgress = (elapsed - displayAt) / TILE_FADE_IN_DURATION;
+                            opacity = TILE_BASE_OPACITY * fadeProgress;
+                        } else if (elapsed >= fadeOutStart) {
+                            const fadeOutProgress = (elapsed - fadeOutStart) / TILE_FADE_OUT_DURATION;
+                            opacity = TILE_BASE_OPACITY * (1 - Math.min(1, fadeOutProgress));
+                        } else {
+                            opacity = TILE_BASE_OPACITY;
+                        }
+                    }
+                    
                     const isHigh = beatTypes[i] === "high";
                     const fillColor = isHigh ? "rgba(239, 68, 68, 0.88)" : "rgba(99, 102, 241, 0.88)";
+
                     ctx.save();
                     ctx.globalAlpha = opacity;
                     ctx.fillStyle = fillColor;
@@ -206,149 +326,52 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 }
             }
 
-            const cvResult = cvResultRef.current;
-            if (cvResult) {
-                const [bx, by, bw, bh] = cvResult.bbox;
-                // Invert bbox x coordinate
-                const invBx = w - bx - bw;
+            // Draw bounding box around hand
+            if (handBox) {
                 ctx.strokeStyle = "#00FF00";
                 ctx.lineWidth = 4;
-                ctx.strokeRect(invBx, by, bw, bh);
+                ctx.strokeRect(handBox.left, handBox.top, handBox.right - handBox.left, handBox.bottom - handBox.top);
 
-                // Draw crosshair at projected point if available
-                if (cvResult.projected_point) {
-                    const [px, py] = cvResult.projected_point;
-                    // Invert x-coordinate to match the mirrored video display
-                    const invPx = w - px;
-                    const crosshairSize = 20;
-                    const lineWidth = 2;
-
-                    ctx.strokeStyle = "#FF00FF";
-                    ctx.lineWidth = lineWidth;
-                    ctx.globalAlpha = 0.8;
-
-                    // Horizontal line
-                    ctx.beginPath();
-                    ctx.moveTo(invPx - crosshairSize, py);
-                    ctx.lineTo(invPx + crosshairSize, py);
-                    ctx.stroke();
-
-                    // Vertical line
-                    ctx.beginPath();
-                    ctx.moveTo(invPx, py - crosshairSize);
-                    ctx.lineTo(invPx, py + crosshairSize);
-                    ctx.stroke();
-
-                    // Center circle
-                    ctx.fillStyle = "#FF00FF";
-                    ctx.globalAlpha = 0.6;
-                    ctx.beginPath();
-                    ctx.arc(invPx, py, 4, 0, Math.PI * 2);
-                    ctx.fill();
-                }
-            }
-
-            animationFrame = requestAnimationFrame(draw);
-        };
-
-        draw();
-
-        return () => {
-            if (animationFrame) cancelAnimationFrame(animationFrame);
-        };
-    }, [stream]);
-
-    // Capture video frames and send to CV API for colour tracking
-    useEffect(() => {
-        if (!videoRef.current || !stream || !canvasRef.current) return;
-
-        const video = videoRef.current;
-        const captureCanvas = document.createElement("canvas");
-        let cancelled = false;
-
-        const tick = async () => {
-            if (cancelled || !videoRef.current || !canvasRef.current) return;
-            const now = performance.now();
-            if (now - lastTrackTimeRef.current < TRACK_INTERVAL_MS) {
-                setTimeout(tick, TRACK_INTERVAL_MS - (now - lastTrackTimeRef.current));
-                return;
-            }
-            if (video.readyState < 2) {
-                setTimeout(tick, 50);
-                return;
-            }
-
-            const w = canvasRef.current.width;
-            const h = canvasRef.current.height;
-            const vw = video.videoWidth;
-            const vh = video.videoHeight;
-            captureCanvas.width = vw;
-            captureCanvas.height = vh;
-            const capCtx = captureCanvas.getContext("2d");
-            if (!capCtx) {
-                setTimeout(tick, TRACK_INTERVAL_MS);
-                return;
-            }
-            capCtx.drawImage(video, 0, 0);
-            const dataUrl = captureCanvas.toDataURL("image/jpeg", 0.85);
-
-            lastTrackTimeRef.current = now;
-            try {
-                const res = await fetch(`${API_BASE}/cv/track`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ image: dataUrl }),
+                // Wrist (landmark 0) position
+                const landmarks = results.multiHandLandmarks![0];
+                const wrist = landmarks[0];
+                setPosition({
+                    x: Math.round((1 - wrist.x) * w),
+                    y: Math.round(wrist.y * h),
                 });
-                if (cancelled) return;
-                const data = (await res.json()) as {
-                    found: boolean;
-                    center: [number, number] | null;
-                    bbox: [number, number, number, number] | null;
-                    projected_point?: [number, number] | null;
-                    rotation_angle?: number | null;
-                };
-                if (data.found && data.center && data.bbox) {
-                    const [cx, cy] = data.center;
-                    const [bx, by, bw, bh] = data.bbox;
-                    const scaleX = w / vw;
-                    const scaleY = h / vh;
-                    const dispCx = cx * scaleX;
-                    const dispCy = cy * scaleY;
-                    const dispBx = bx * scaleX;
-                    const dispBy = by * scaleY;
-                    const dispBw = bw * scaleX;
-                    const dispBh = bh * scaleY;
-                    
-                    let projPoint: [number, number] | undefined;
-                    if (data.projected_point) {
-                        const [ppx, ppy] = data.projected_point;
-                        projPoint = [ppx * scaleX, ppy * scaleY];
-                    }
-
-                    setPosition({ x: Math.round(w - dispCx), y: Math.round(dispCy) });
-                    cvResultRef.current = {
-                        center: [w - dispCx, dispCy],
-                        bbox: [w - dispBx - dispBw, dispBy, dispBw, dispBh],
-                        projected_point: projPoint,
-                        rotation_angle: data.rotation_angle ?? undefined,
-                    };
-                } else {
-                    setPosition(null);
-                    cvResultRef.current = null;
-                }
-            } catch {
-                if (!cancelled) {
-                    setPosition(null);
-                    cvResultRef.current = null;
-                }
+            } else {
+                setPosition(null);
             }
-            setTimeout(tick, TRACK_INTERVAL_MS);
-        };
 
-        tick();
+            ctx.restore();
+        });
+
+        handsRef.current = hands;
 
         return () => {
-            cancelled = true;
+            hands.close();
+        };
+    }, [showEndScreen]);
+
+    // Process video frames
+    useEffect(() => {
+        if (!videoRef.current || !handsRef.current || !stream) return;
+
+        let animationFrame: number;
+
+        const detectHands = async () => {
+            if (videoRef.current && videoRef.current.readyState === 4) {
+                await handsRef.current!.send({ image: videoRef.current });
+            }
+            animationFrame = requestAnimationFrame(detectHands);
+        };
+
+        detectHands();
+
+        return () => {
+            if (animationFrame) {
+                cancelAnimationFrame(animationFrame);
+            }
         };
     }, [stream]);
 
@@ -428,7 +451,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     {position != null ? `X: ${position.x}  Y: ${position.y}` : "X: —  Y: —"}
                 </span>
                 <span className="font-display text-sm tracking-wider text-white/90">
-                    SCORE: 0
+                    SCORE: {score}
                 </span>
             </div>
 
@@ -441,6 +464,32 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                         </span>
                     </div>
                 )}
+
+                {/* End Screen */}
+                {showEndScreen && (
+                    <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/95">
+                        <div className="text-center space-y-8">
+                            <h2 className="font-display text-5xl font-black text-white tracking-wider">
+                                GAME OVER
+                            </h2>
+                            <div className="space-y-2">
+                                <p className="font-display text-2xl text-white/70 tracking-widest">
+                                    YOUR SCORE
+                                </p>
+                                <p className="font-display text-8xl font-black text-white tabular-nums">
+                                    {score}
+                                </p>
+                            </div>
+                            <button
+                                onClick={onBack}
+                                className="px-8 py-4 bg-white text-black font-display text-lg tracking-widest font-bold hover:bg-white/90 transition-colors cursor-pointer"
+                            >
+                                PLAY AGAIN
+                            </button>
+                        </div>
+                    </div>
+                )}
+
                 {loading && (
                     <span className="text-muted-foreground font-display text-sm tracking-widest animate-pulse">
                         Requesting camera access…
