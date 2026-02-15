@@ -1,7 +1,7 @@
 import { useState } from "react";
 
 interface StartScreenProps {
-    onStart: () => void;
+    onStart: (audioUrl?: string) => void;
     onSavedSongs: () => void;
 }
 
@@ -36,10 +36,6 @@ const StartScreen = ({ onStart, onSavedSongs }: StartScreenProps) => {
                 `${API_BASE}/elevenlabs/generatemusic?prompt=${encodeURIComponent(elevenLabsPrompt)}&duration=${durationMs}`
             );
             const blob = await res.blob();
-            const audioUrl = URL.createObjectURL(blob);
-            const audio = new Audio(audioUrl);
-            audio.loop = true;
-            audio.play();
 
             const form = new FormData();
             form.append("file", blob, "mysong.mp3");
@@ -52,9 +48,8 @@ const StartScreen = ({ onStart, onSavedSongs }: StartScreenProps) => {
             });
 
             const data = await saveres.json();
-            console.log("Saved song:", data.url);
-
-            onStart();
+            const savedAudioUrl = data.url ? `${API_BASE}${data.url}` : undefined;
+            onStart(savedAudioUrl);
         } catch (err: unknown) {
             console.error("Music generation failed:", err);
             setError("Music generation failed. Please try again.");

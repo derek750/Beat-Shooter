@@ -1,9 +1,13 @@
 import { useEffect, useState } from "react";
 
+const API_BASE = "http://localhost:8000";
+
 interface Song {
-  _id: string;
-  name: string;
+  id: string;
   url: string;
+  prompt?: string;
+  duration_ms?: number;
+  beats?: number[];
 }
 
 interface SongListPageProps {
@@ -42,25 +46,26 @@ const SongListPage = ({ onBack, onSelectSong }: SongListPageProps) => {
       </div>
 
       <div className="flex-1 overflow-auto p-4 space-y-2">
-        {songs.map((song) => (
+        {songs.map((song) => {
+          const fullUrl = `${API_BASE}${song.url}`;
+          return (
           <div
-            key={song._id}
+            key={song.id}
             className="flex items-center justify-between bg-card p-3 rounded-lg cursor-pointer hover:bg-card/80"
-            onClick={() => onSelectSong(song.url)}
+            onClick={() => onSelectSong(fullUrl)}
           >
-            <span>{song.name}</span>
+            <span>{song.prompt || "Untitled"}</span>
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                const audio = new Audio(song.url);
-                audio.play();
+                onSelectSong(fullUrl);
               }}
               className="px-2 py-1 bg-primary text-primary-foreground rounded-md text-sm"
             >
               Play
             </button>
           </div>
-        ))}
+        );})}
       </div>
     </div>
   );

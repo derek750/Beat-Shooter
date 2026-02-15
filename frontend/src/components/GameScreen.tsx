@@ -4,10 +4,11 @@ import { drawConnectors, drawLandmarks } from "@mediapipe/drawing_utils";
 import { HAND_CONNECTIONS } from "@mediapipe/hands";
 
 interface GameScreenProps {
+  audioUrl?: string;
   onBack: () => void;
 }
 
-const GameScreen = ({ onBack }: GameScreenProps) => {
+const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
@@ -15,6 +16,39 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
   const [loading, setLoading] = useState(true);
   const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
   const handsRef = useRef<Hands | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [countdown, setCountdown] = useState<number | null>(null);
+
+  // 5-second countdown, then play audio when provided
+  useEffect(() => {
+    if (!audioUrl) {
+      setCountdown(null);
+      return;
+    }
+    setCountdown(5);
+    const interval = setInterval(() => {
+      setCountdown((prev) => {
+        if (prev == null || prev <= 1) {
+          clearInterval(interval);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [audioUrl]);
+
+  useEffect(() => {
+    if (!audioUrl || countdown !== 0) return;
+    const audio = new Audio(audioUrl);
+    audio.loop = true;
+    audioRef.current = audio;
+    audio.play().catch((err) => console.warn("Audio autoplay failed:", err));
+    return () => {
+      audio.pause();
+      audioRef.current = null;
+    };
+  }, [audioUrl, countdown]);
 
   // Initialize MediaPipe Hands
   useEffect(() => {
@@ -182,7 +216,14 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
       </div>
 
       {/* Video/canvas area only below the bar, mirrored so hand-right = right */}
-      <div className="flex-1 min-h-0 bg-card flex items-center justify-center overflow-hidden">
+      <div className="flex-1 min-h-0 bg-card flex items-center justify-center overflow-hidden relative">
+        {countdown != null && countdown > 0 && (
+          <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/70">
+            <span className="font-display text-9xl font-black text-white tabular-nums animate-pulse">
+              {countdown}
+            </span>
+          </div>
+        )}
         {loading && (
           <span className="text-muted-foreground font-display text-sm tracking-widest animate-pulse">
             Requesting camera access…
