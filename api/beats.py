@@ -1,11 +1,39 @@
+import os
+from urllib.parse import urlparse, unquote
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 import librosa
 import numpy as np
-import sys
 from scipy.signal import find_peaks
 
-def detect_buildups_and_drops(mp3_file, debug=True):
-    # Load the audio file
-    y, sr = librosa.load(mp3_file)
+router = APIRouter(prefix="/beats", tags=["beats"])
+
+SONGS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "songs")
+
+
+class CreateBeatsBody(BaseModel):
+    audio_url: str
+
+
+def _url_to_local_path(audio_url: str) -> str:
+    """Resolve frontend audio URL to local songs file path."""
+    parsed = urlparse(audio_url)
+    path = unquote(parsed.path)
+    filename = os.path.basename(path)
+    if not filename.lower().endswith((".mp3", ".wav", ".ogg")):
+        raise HTTPException(status_code=400, detail="Unsupported audio format")
+    local = os.path.join(SONGS_DIR, filename)
+    if not os.path.isfile(local):
+        raise HTTPException(status_code=404, detail=f"Audio file not found: {filename}")
+    return local
+
+
+@router.post("/create_beats")
+def create_beats(body: CreateBeatsBody, debug: bool = False):
+    """Analyze audio and return beat map as arrays (timestamps in seconds, types)."""
+    mp3_path = _url_to_local_path(body.audio_url)
+    y, sr = librosa.load(mp3_path)
     duration = librosa.get_duration(y=y, sr=sr)
     
     if debug:
@@ -70,33 +98,29 @@ def detect_buildups_and_drops(mp3_file, debug=True):
         })
     
     # Sort all points by time
-    all_points.sort(key=lambda x: x['time'])
-    
+    all_points.sort(key=lambda x: float(x["time"]))
+
     if debug:
         print(f"\nTotal points of interest: {len(all_points)}")
         print("\n=== All Points of Interest (chronological) ===")
         for i, point in enumerate(all_points):
-            print(f"  {i+1}. {point['time']:6.2f}s - {point['type'].upper():4s} (energy: {point['energy']:.4f})")
-    
+            print(f"  {i+1}. {float(point['time']):6.2f}s - {point['type'].upper():4s} (energy: {float(point['energy']):.4f})")
+
+    # Ensure all values are JSON-serializable (no numpy scalars)
+    all_points_json = [
+        {
+            "time": float(p["time"]),
+            "type": str(p["type"]),
+            "frame": int(p["frame"]),
+            "energy": float(p["energy"]),
+        }
+        for p in all_points
+    ]
+    timestamps = [p["time"] for p in all_points_json]
+    types = [p["type"] for p in all_points_json]
     return {
-        'all_points': all_points,
-        'duration': duration,
-        'timestamps': np.array([p['time'] for p in all_points]),  # Just the times
-        'types': [p['type'] for p in all_points]  # Just the types
+        "all_points": all_points_json,
+        "duration": float(duration),
+        "timestamps": timestamps,
+        "types": types,
     }
-
-audio_file = sys.argv[1] if len(sys.argv) > 1 else "songs/audio.mp3"
-
-print(f"Analyzing: {audio_file}")
-
-try:
-    result = detect_buildups_and_drops(audio_file, debug=True)
-    
-    print("\n=== RESULTS ===")
-    print(f"Timestamps array: {result['timestamps']}")
-    print(f"Types array: {result['types']}")
-    
-except Exception as e:
-    print(f"Error: {e}")
-    import traceback
-    traceback.print_exc()

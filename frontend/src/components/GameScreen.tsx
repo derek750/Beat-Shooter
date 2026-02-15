@@ -7,10 +7,11 @@ interface GameScreenProps {
 }
 
 const API_BASE = "http://localhost:8000";
-const TILE_RADIUS = 28;
-const TILE_FADE_IN_DURATION = 0.35;
+const TILE_RADIUS = 70;
+const TILE_FADE_IN_DURATION = 0.05; // quick pop so circle appears right when beat hits
 const TILE_FADE_OUT_DURATION = 0.4; // constant time to fade out
-const TILE_VISIBLE_DURATION = 1.2; // full opacity before fade out
+const TILE_VISIBLE_DURATION = 4; // full opacity before fade out
+const ENERGY_RADIUS_SCALE = 0.6; // higher energy = up to 60% bigger
 const TILE_BASE_OPACITY = 0.82;
 
 type Tile = { x: number; y: number };
@@ -26,8 +27,12 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const [countdown, setCountdown] = useState<number | null>(null);
     const tilesRef = useRef<Tile[]>([]);
-    /** Placeholder: seconds after audio start when each tile should appear (same length as tiles) */
+    /** Seconds after audio start when each tile should appear (from beat map). */
     const tileDisplayTimesRef = useRef<number[]>([]);
+    /** Beat point types from beat map ('low' | 'high'), same length as beat timestamps. */
+    const beatTypesRef = useRef<string[]>([]);
+    /** Energy values per beat (for circle size scaling), same length as timestamps. */
+    const energiesRef = useRef<number[]>([]);
     const countdownRef = useRef<number | null>(null);
     const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const gameStartTimeRef = useRef<number | null>(null);
@@ -39,6 +44,8 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
             setCountdown(null);
             tilesRef.current = [];
             tileDisplayTimesRef.current = [];
+            beatTypesRef.current = [];
+            energiesRef.current = [];
             return;
         }
 
@@ -47,9 +54,23 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         const runBeforeCountdown = async () => {
             const width = window.innerWidth;
             const height = window.innerHeight - 60;
-            const count = 12;
 
-            // create beat map
+            const beatMapRes = await fetch(`${API_BASE}/beats/create_beats`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ audio_url: audioUrl }),
+            });
+            if (cancelled) return;
+            if (!beatMapRes.ok) {
+                console.warn("Beat map failed, using placeholder times:", await beatMapRes.text());
+            }
+            const beatMap = beatMapRes.ok
+                ? (await beatMapRes.json()) as { timestamps: number[]; types: string[]; all_points?: { energy: number }[]; duration?: number }
+                : { timestamps: [] as number[], types: [] as string[], all_points: [] };
+            const beatTimestamps = beatMap.timestamps ?? [];
+            beatTypesRef.current = beatMap.types ?? [];
+            energiesRef.current = (beatMap.all_points ?? []).map((p) => p.energy ?? 0);
+            const count = Math.max(1, beatTimestamps.length);
 
             const tilesRes = await fetch(`${API_BASE}/tiles/generate`, {
                 method: "POST",
@@ -63,8 +84,10 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 y: (tilesData.y as number[])[i] / height,
             }));
             tilesRef.current = tiles;
-            // Placeholder: display time (seconds after audio start) for each tile
-            tileDisplayTimesRef.current = Array.from({ length: count }, (_, i) => i * 0.5);
+            tileDisplayTimesRef.current =
+                beatTimestamps.length > 0
+                    ? [...beatTimestamps]
+                    : Array.from({ length: count }, (_, i) => i * 0.5);
 
             if (cancelled) return;
             setCountdown(5);
@@ -137,6 +160,11 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 const elapsed = (performance.now() - gameStartTimeRef.current) / 1000;
                 const times = tileDisplayTimesRef.current;
                 const tiles = tilesRef.current;
+                const beatTypes = beatTypesRef.current;
+                const energies = energiesRef.current;
+                const minE = energies.length > 0 ? Math.min(...energies) : 0;
+                const maxE = energies.length > 0 ? Math.max(...energies) : 1;
+                const energyRange = maxE - minE || 1;
                 for (let i = 0; i < tiles.length; i++) {
                     const displayAt = times[i] ?? 0;
                     if (elapsed < displayAt) continue;
@@ -155,14 +183,18 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     const cx = (1 - tiles[i].x) * w;
                     const cy = tiles[i].y * h;
 
+                    const energyNorm = energies[i] != null ? (energies[i] - minE) / energyRange : 0.5;
+                    const radius = TILE_RADIUS * (1 + energyNorm * ENERGY_RADIUS_SCALE);
+
+                    const isHigh = beatTypes[i] === "high";
+                    const fillColor = isHigh ? "rgba(239, 68, 68, 0.88)" : "rgba(99, 102, 241, 0.88)";
+
                     ctx.save();
                     ctx.globalAlpha = opacity;
-                    // Slightly transparent fill
-                    ctx.fillStyle = "rgba(99, 102, 241, 0.88)";
+                    ctx.fillStyle = fillColor;
                     ctx.beginPath();
-                    ctx.arc(cx, cy, TILE_RADIUS, 0, Math.PI * 2);
+                    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
                     ctx.fill();
-                    // Subtle border
                     ctx.strokeStyle = "rgba(255, 255, 255, 0.55)";
                     ctx.lineWidth = 2;
                     ctx.stroke();
