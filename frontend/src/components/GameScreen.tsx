@@ -105,7 +105,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 if (now - lastPressAtRef.current < 80) return;
                 lastPressAtRef.current = now;
 
-                if (button === 1) {
+                if (button === 0) {
                     // ✅ "does something in the app" — visible proof
                     setScore((s) => s + 1);
                 }

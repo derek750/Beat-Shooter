@@ -21,6 +21,7 @@ _baud_rate: int = 115200
 
 _buttons: list[int] = []
 _buttons_lock = threading.Lock()
+_button_cond = threading.Condition(_buttons_lock)  # condition to wait for button presses
 
 _pitch: float = 0.0
 _roll: float = 0.0
@@ -41,27 +42,20 @@ CONSTANT_PORT = "/dev/cu.ESP32_Controller"
 _ws_clients: set[WebSocket] = set()
 _ws_clients_lock = threading.Lock()
 
-# Thread-safe queue from serial thread -> async websocket broadcaster
 _event_q: "queue.Queue[dict]" = queue.Queue(maxsize=2000)
 
-# Ensure broadcaster starts only once
 _broadcaster_started = False
 _broadcaster_lock = threading.Lock()
 
 
+# ----------------------------
+# Parse incoming ESP32 lines
+# ----------------------------
 def _parse_line(line: str) -> Optional[tuple[list[int] | None, float | None, float | None]]:
-    """
-    Parse a line from ESP32 into (button_states, pitch_deg, roll_deg). Any can be None.
-
-    Accepts either:
-    - JSON: {"buttons":[0,1,0], "pitch": 12.3, "roll": -4.5}
-    - Raw: "0101" or "0 1 0 1" (extracts 0/1 chars)
-    """
     line = line.strip()
     if not line:
         return None
 
-    # JSON
     if line.startswith("{"):
         try:
             data = json.loads(line)
@@ -78,7 +72,6 @@ def _parse_line(line: str) -> Optional[tuple[list[int] | None, float | None, flo
         except Exception:
             return None
 
-    # Non-JSON: extract any 0/1 chars
     parts = re.findall(r"[01]", line)
     if parts:
         return ([int(p) for p in parts], None, None)
@@ -86,35 +79,30 @@ def _parse_line(line: str) -> Optional[tuple[list[int] | None, float | None, flo
     return None
 
 
+# ----------------------------
+# Event push
+# ----------------------------
 def _push_event(event: dict) -> None:
-    """
-    Called from any thread. Adds to in-memory history and to websocket queue.
-    """
     with _events_lock:
         _events.append(event)
         if len(_events) > _max_events:
             _events.pop(0)
 
-    # push to websocket queue (non-blocking best-effort)
     try:
         _event_q.put_nowait(event)
     except queue.Full:
-        # drop if overloaded
         pass
 
 
 def _emit_button_change(kind: str, index: int) -> None:
-    _push_event({"type": kind, "button": index})
+    _push_event({"type": kind, "button": index, "buttons": list(_buttons)})
 
 
+# ----------------------------
+# ESP32 reader thread
+# ----------------------------
 def _reader_thread() -> None:
-    """
-    Reads serial lines forever until disconnect or error.
-    Emits PRESS/RELEASE events based on edge changes.
-    Updates button state + pitch/roll.
-    """
     global _buttons, _pitch, _roll
-
     prev: list[int] = []
 
     while True:
@@ -141,10 +129,10 @@ def _reader_thread() -> None:
             buttons, pitch_deg, roll_deg = parsed
 
             if buttons is not None:
-                with _buttons_lock:
+                with _button_cond:
                     _buttons = buttons
+                    _button_cond.notify_all()  # wake backend waiters
 
-                # edge detect
                 for i, v in enumerate(buttons):
                     p = prev[i] if i < len(prev) else 0
                     if v != p:
@@ -166,25 +154,16 @@ def _reader_thread() -> None:
 
 
 # ----------------------------
-# Background broadcaster (async)
+# Backend-driven WebSocket broadcaster
 # ----------------------------
-async def _broadcaster_loop() -> None:
-    """
-    Runs forever. Pulls events from thread-safe queue and broadcasts to all WS clients.
-    """
+async def _broadcaster_loop():
     while True:
-        # NOTE: queue.Queue.get() is blocking and not awaitable.
-        # We do it in a threadpool-ish way by using asyncio.to_thread.
         import asyncio
-
         event = await asyncio.to_thread(_event_q.get)
         msg = json.dumps(event)
 
         with _ws_clients_lock:
             clients = list(_ws_clients)
-
-        if not clients:
-            continue
 
         dead: list[WebSocket] = []
         for ws in clients:
@@ -200,76 +179,89 @@ async def _broadcaster_loop() -> None:
 
 
 def _ensure_broadcaster_started() -> None:
-    """
-    Called from sync context; schedules the broadcaster on first WS connect.
-    """
     global _broadcaster_started
     with _broadcaster_lock:
         if _broadcaster_started:
             return
         _broadcaster_started = True
 
-    # We can't "await" here; broadcaster will be started inside ws endpoint
-    # (we’ll do it there when we have an event loop).
+
+def _emit_state_snapshot() -> None:
+    with _buttons_lock:
+        buttons = list(_buttons)
+    _push_event({"type": "STATE", "buttons": buttons})
 
 
-class ConnectBody(BaseModel):
-    port: str
-    baud_rate: int = 115200
+# ----------------------------
+# Backend-driven button helper
+# ----------------------------
+def backend_press_button(index: int):
+    """
+    Set button to 1 in backend and push to event queue.
+    """
+    with _button_cond:
+        if len(_buttons) <= index:
+            _buttons.extend([0] * (index + 1 - len(_buttons)))
+        _buttons[index] = 1
+        _button_cond.notify_all()
+    _emit_button_change("PRESS", index)
 
 
+def backend_wait_for_button(index: int, desired: int = 1, timeout: Optional[float] = None) -> bool:
+    """
+    Wait for a button to reach desired state.
+    """
+    print("B")
+    with _button_cond:
+        while len(_buttons) <= index or _buttons[index] != desired:
+            if not _button_cond.wait(timeout=timeout):
+                return False
+        return True
+
+
+# ----------------------------
+# WebSocket endpoint
+# ----------------------------
 @router.websocket("/ws")
 async def ws_events(websocket: WebSocket):
-    """
-    WebSocket stream:
-      - STATE snapshot on connect: {"type":"STATE","buttons":[...]}
-      - Edge events: {"type":"PRESS"/"RELEASE","button":i}
-    """
     await websocket.accept()
 
-    # Start broadcaster task ONCE (now that we are in an async event loop)
     _ensure_broadcaster_started()
-    # Only the first connected client will actually start the task.
-    # If task already started, creating another would be wasteful, so guard:
-    # We'll detect by checking if queue consumer is running via a private flag.
-    # Simplest: start it when first client connects and ignore subsequent.
-    # We do that here by using another guard with the same lock.
+
     start_task = False
     with _broadcaster_lock:
-        # if started flag is true we still don't know if task launched;
-        # launch exactly once by attaching an attribute on router.
         if not getattr(router, "_ws_broadcast_task_started", False):
             setattr(router, "_ws_broadcast_task_started", True)
             start_task = True
 
     if start_task:
         import asyncio
-
         asyncio.create_task(_broadcaster_loop())
 
     with _ws_clients_lock:
         _ws_clients.add(websocket)
 
-    # Send current button state immediately
-    try:
-        with _buttons_lock:
-            current = list(_buttons)
-        await websocket.send_text(json.dumps({"type": "STATE", "buttons": current}))
-    except Exception:
-        pass
+    # Send current backend state once
+    _emit_state_snapshot()
 
     try:
-        # We don't require client messages.
-        # Just keep the socket open until disconnect.
+        # Keep connection open, no frontend messages required
         while True:
-            await websocket.receive_text()
+            await asyncio.sleep(3600)  # sleep indefinitely, or until disconnect
     except WebSocketDisconnect:
-        pass
-    except Exception:
         pass
     finally:
         with _ws_clients_lock:
             _ws_clients.discard(websocket)
+
+
+
+# ----------------------------
+# REST API endpoints
+# ----------------------------
+class ConnectBody(BaseModel):
+    port: str
+    baud_rate: int = 115200
 
 
 @router.get("/ports")
@@ -284,41 +276,26 @@ def list_ports():
 
 @router.post("/connect")
 def connect(body: ConnectBody):
-    """
-    Connects to ESP32.
-    NOTE: You were passing port in body, but using CONSTANT_PORT anyway.
-    We'll keep your behavior: always use CONSTANT_PORT.
-    """
     global _serial_conn, _connected_port, _baud_rate, _reader
-
     with _serial_lock:
         if _serial_conn is not None and _serial_conn.is_open:
             return {"success": False, "detail": f"Already connected to {_connected_port}. Disconnect first."}
-
         try:
-            conn = serial.Serial(
-                port=CONSTANT_PORT,
-                baudrate=body.baud_rate,
-                timeout=0.1,
-            )
-            # clear stale bytes
+            conn = serial.Serial(port=body.port, baudrate=body.baud_rate, timeout=0.1)
             try:
                 conn.reset_input_buffer()
                 conn.reset_output_buffer()
             except Exception:
                 pass
-
             _serial_conn = conn
-            _connected_port = CONSTANT_PORT
+            _connected_port = body.port
             _baud_rate = body.baud_rate
-
         except serial.SerialException as e:
             raise HTTPException(status_code=400, detail=str(e))
 
     _reader = threading.Thread(target=_reader_thread, daemon=True)
     _reader.start()
-
-    return {"success": True, "port": CONSTANT_PORT, "baud_rate": body.baud_rate}
+    return {"success": True, "port": body.port, "baud_rate": body.baud_rate}
 
 
 @router.post("/disconnect")
@@ -328,13 +305,11 @@ def disconnect():
         conn = _serial_conn
         _serial_conn = None
         _connected_port = None
-
     if conn is not None and conn.is_open:
         try:
             conn.close()
         except Exception:
             pass
-
     return {"success": True, "detail": "Disconnected"}
 
 
@@ -351,6 +326,15 @@ def get_buttons():
     with _buttons_lock:
         buttons = list(_buttons)
     return {"buttons": buttons, "count": len(buttons)}
+
+
+@router.post("/buttons")
+def click_button(index: int):
+    """
+    Endpoint to simulate backend button press.
+    """
+    backend_press_button(index)
+    return {"buttons": list(_buttons), "pressed": index}
 
 
 @router.get("/events")
