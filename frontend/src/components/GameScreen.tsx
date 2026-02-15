@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 interface GameScreenProps {
     audioUrl?: string;
@@ -6,6 +6,7 @@ interface GameScreenProps {
 }
 
 const API_BASE = "http://localhost:8000";
+const WS_BASE = API_BASE.replace(/^http/, "ws");
 const TILE_RADIUS = 70;
 /** Tiles within this many before/after cannot overlap (passed to API). */
 const TILE_WINDOW = 6;
@@ -17,8 +18,6 @@ const TILE_VISIBLE_DURATION = 4; // full opacity before fade out
 const ENERGY_RADIUS_SCALE = 0.6; // higher energy = up to 60% bigger
 const TILE_BASE_OPACITY = 0.82;
 const END_SCREEN_DELAY = 3; // seconds after last tile to show end screen
-const HIT_CONTACT_DURATION = 0.5; // seconds of contact needed to hit a tile
-const HIT_FADE_OUT_DURATION = 0.3; // quick fade when hit
 
 type Tile = { x: number; y: number };
 
@@ -61,7 +60,62 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const gameStartTimeRef = useRef<number | null>(null);
     const gameEndTimeRef = useRef<number | null>(null);
     const endScreenShownRef = useRef(false);
+    const esp32WsRef = useRef<WebSocket | null>(null);
     countdownRef.current = countdown;
+
+    /** Hit any visible tiles that the current CV bbox overlaps (used on ESP32 button PRESS). */
+    const hitTilesUnderBbox = useCallback(() => {
+        const cvResult = cvResultRef.current;
+        if (!cvResult) return;
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        if (gameStartTimeRef.current == null) return;
+        const w = canvas.width;
+        const h = canvas.height;
+        if (w === 0 || h === 0) return;
+        const elapsed = (performance.now() - gameStartTimeRef.current) / 1000;
+        const times = tileDisplayTimesRef.current;
+        const tiles = tilesRef.current;
+        const energies = energiesRef.current;
+        const minE = energies.length > 0 ? Math.min(...energies) : 0;
+        const maxE = energies.length > 0 ? Math.max(...energies) : 1;
+        const energyRange = maxE - minE || 1;
+        // Bbox is stored with inverted x; convert to canvas space (same as draw loop: invBx = w - bx - bw)
+        const [bx, by, bw, bh] = cvResult.bbox;
+        const cvBox = {
+            left: w - bx - bw,
+            top: by,
+            right: w - bx,
+            bottom: by + bh,
+        };
+        for (let i = 0; i < tiles.length; i++) {
+            if (tileHitStatesRef.current[i]) continue;
+            const displayAt = times[i] ?? 0;
+            if (elapsed < displayAt) continue;
+            const fadeOutStart = displayAt + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION;
+            if (elapsed >= fadeOutStart + TILE_FADE_OUT_DURATION) continue;
+            const energyNorm = energies[i] != null ? (energies[i] - minE) / energyRange : 0.5;
+            const radius = TILE_RADIUS * (1 + energyNorm * ENERGY_RADIUS_SCALE);
+            const cx = (1 - tiles[i].x) * w;
+            const cy = tiles[i].y * h;
+            const tileLeft = cx - radius;
+            const tileRight = cx + radius;
+            const tileTop = cy - radius;
+            const tileBottom = cy + radius;
+            const isColliding = !(
+                cvBox.right < tileLeft ||
+                cvBox.left > tileRight ||
+                cvBox.bottom < tileTop ||
+                cvBox.top > tileBottom
+            );
+            if (isColliding) {
+                tileHitStatesRef.current[i] = true;
+                tileHitTimesRef.current[i] = elapsed;
+                tileContactStartRef.current[i] = null;
+                setScore((prev) => prev + 1);
+            }
+        }
+    }, []);
 
     // Before countdown: fetch tiles + placeholder API, then 5-second countdown
     useEffect(() => {
@@ -189,6 +243,27 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         };
     }, [audioUrl, countdown]);
 
+    // ESP32 WebSocket: on button PRESS, hit any tiles under the current CV bbox
+    useEffect(() => {
+        if (!audioUrl || countdown !== 0) return;
+        const ws = new WebSocket(`${WS_BASE}/esp32/ws`);
+        esp32WsRef.current = ws;
+        ws.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data) as { type?: string; button?: number };
+                if (data.type === "PRESS") {
+                    hitTilesUnderBbox();
+                }
+            } catch {
+                // ignore parse errors
+            }
+        };
+        return () => {
+            ws.close();
+            esp32WsRef.current = null;
+        };
+    }, [audioUrl, countdown, hitTilesUnderBbox]);
+
     // Draw loop: tiles + CV bbox + crosshair at projected point
     useEffect(() => {
         if (!canvasRef.current || !stream) return;
@@ -206,14 +281,6 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
             ctx.clearRect(0, 0, w, h);
 
             const cvResult = cvResultRef.current;
-            const cvBox = cvResult
-                ? {
-                    left: cvResult.bbox[0],
-                    top: cvResult.bbox[1],
-                    right: cvResult.bbox[0] + cvResult.bbox[2],
-                    bottom: cvResult.bbox[1] + cvResult.bbox[3],
-                }
-                : null;
 
             if (countdownRef.current === 0 && tilesRef.current.length > 0 && gameStartTimeRef.current != null) {
                 const elapsed = (performance.now() - gameStartTimeRef.current) / 1000;
@@ -244,53 +311,16 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     const radius = TILE_RADIUS * (1 + energyNorm * ENERGY_RADIUS_SCALE);
                     const cx = (1 - tiles[i].x) * w;
                     const cy = tiles[i].y * h;
-                    
-                    // Check collision with CV-tracked object (colour/bbox) if tile is visible and not yet hit
-                    if (!tileHitStatesRef.current[i] && cvBox) {
-                        const tileLeft = cx - radius;
-                        const tileRight = cx + radius;
-                        const tileTop = cy - radius;
-                        const tileBottom = cy + radius;
-                        
-                        // Check if CV bbox overlaps with tile circle (using bounding box collision)
-                        const isColliding = !(
-                            cvBox.right < tileLeft ||
-                            cvBox.left > tileRight ||
-                            cvBox.bottom < tileTop ||
-                            cvBox.top > tileBottom
-                        );
-                        
-                        if (isColliding) {
-                            // Start or continue contact
-                            if (tileContactStartRef.current[i] === null) {
-                                tileContactStartRef.current[i] = elapsed;
-                            } else {
-                                // Check if contact duration met
-                                const contactDuration = elapsed - tileContactStartRef.current[i];
-                                if (contactDuration >= HIT_CONTACT_DURATION) {
-                                    tileHitStatesRef.current[i] = true;
-                                    tileHitTimesRef.current[i] = elapsed;
-                                    tileContactStartRef.current[i] = null;
-                                    setScore(prev => prev + 1);
-                                }
-                            }
-                        } else {
-                            // No collision, reset contact
-                            tileContactStartRef.current[i] = null;
-                        }
-                    }
-                    
+
+                    // Score is only added when ESP32 button is clicked while bbox is over a tile (see hitTilesUnderBbox + WebSocket).
+
                     // Calculate opacity based on hit state or normal lifecycle
                     let opacity: number;
                     const isHit = tileHitStatesRef.current[i];
                     
                     if (isHit) {
-                        // Hit tile - fade out quickly
-                        const hitTime = tileHitTimesRef.current[i] ?? elapsed;
-                        const timeSinceHit = elapsed - hitTime;
-                        if (timeSinceHit >= HIT_FADE_OUT_DURATION) continue; // Don't draw
-                        const fadeProgress = timeSinceHit / HIT_FADE_OUT_DURATION;
-                        opacity = TILE_BASE_OPACITY * (1 - fadeProgress);
+                        // Hit tile - disappear immediately (don't draw)
+                        continue;
                     } else {
                         // Normal lifecycle
                         const fadeOutStart = displayAt + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION;
