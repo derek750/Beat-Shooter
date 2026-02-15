@@ -8,6 +8,10 @@ interface GameScreenProps {
 
 const API_BASE = "http://localhost:8000";
 const TILE_RADIUS = 70;
+/** Tiles within this many before/after cannot overlap (passed to API). */
+const TILE_WINDOW = 6;
+/** Minimum pixel distance between tiles in the window (passed to API). */
+const TILE_SPACING_RADIUS = 2 * TILE_RADIUS;
 const TILE_FADE_IN_DURATION = 0.05; // quick pop so circle appears right when beat hits
 const TILE_FADE_OUT_DURATION = 0.4; // constant time to fade out
 const TILE_VISIBLE_DURATION = 4; // full opacity before fade out
@@ -75,7 +79,13 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
             const tilesRes = await fetch(`${API_BASE}/tiles/generate`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ width, height, count }),
+                body: JSON.stringify({
+                    width,
+                    height,
+                    count,
+                    tile_window: TILE_WINDOW,
+                    radius: TILE_SPACING_RADIUS,
+                }),
             });
             if (cancelled) return;
             const tilesData = await tilesRes.json();
