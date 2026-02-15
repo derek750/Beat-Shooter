@@ -12,17 +12,25 @@ function App() {
     <>
       {page === "start" && (
         <StartScreen
-          onStart={() => setPage("game")}
+          onStart={(audioUrl) => {
+            setCurrentSong(audioUrl ?? null);
+            setPage("game");
+          }}
           onSavedSongs={() => setPage("songs")}
         />
       )}
-      {page === "game" && <GameScreen onBack={() => setPage("start")} />}
+      {page === "game" && (
+        <GameScreen
+          audioUrl={currentSong ?? undefined}
+          onBack={() => setPage("start")}
+        />
+      )}
       {page === "songs" && (
         <SongListPage
           onBack={() => setPage("start")}
           onSelectSong={(songUrl: string) => {
             setCurrentSong(songUrl);
-            setPage("game"); // optionally start game with selected song
+            setPage("game");
           }}
         />
       )}

@@ -4,10 +4,11 @@ import { drawConnectors, drawLandmarks } from "@mediapipe/drawing_utils";
 import { HAND_CONNECTIONS } from "@mediapipe/hands";
 
 interface GameScreenProps {
+  audioUrl?: string;
   onBack: () => void;
 }
 
-const GameScreen = ({ onBack }: GameScreenProps) => {
+const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
@@ -15,6 +16,20 @@ const GameScreen = ({ onBack }: GameScreenProps) => {
   const [loading, setLoading] = useState(true);
   const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
   const handsRef = useRef<Hands | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Play audio when provided
+  useEffect(() => {
+    if (!audioUrl) return;
+    const audio = new Audio(audioUrl);
+    audio.loop = true;
+    audioRef.current = audio;
+    audio.play().catch((err) => console.warn("Audio autoplay failed:", err));
+    return () => {
+      audio.pause();
+      audioRef.current = null;
+    };
+  }, [audioUrl]);
 
   // Initialize MediaPipe Hands
   useEffect(() => {
