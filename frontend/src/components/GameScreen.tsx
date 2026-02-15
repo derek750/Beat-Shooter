@@ -17,6 +17,9 @@ const TILE_FADE_OUT_DURATION = 0.4; // constant time to fade out
 const TILE_VISIBLE_DURATION = 4; // full opacity before fade out
 const ENERGY_RADIUS_SCALE = 0.6; // higher energy = up to 60% bigger
 const TILE_BASE_OPACITY = 0.82;
+/** Assumed hand distance (z) when MediaPipe doesn't provide it; ray origin uses hand's z. */
+const ASSUMED_HAND_DISTANCE_Z = 1.0;
+const CROSSHAIR_SIZE = 24;
 
 type Tile = { x: number; y: number };
 
@@ -27,6 +30,10 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const [error, setError] = useState<string | null>(null);
     const [loading, setLoading] = useState(true);
     const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
+    /** Hand orientation in degrees: rotation (roll in image plane), yaw (left/right), tilt (pitch). */
+    const [orientation, setOrientation] = useState<{ rotation: number; yaw: number; tilt: number } | null>(null);
+    /** Crosshair position (pixels) where hand orientation + position intersects plane z = CROSSHAIR_Z. */
+    const [crosshair, setCrosshair] = useState<{ x: number; y: number } | null>(null);
     const handsRef = useRef<Hands | null>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const [countdown, setCountdown] = useState<number | null>(null);
@@ -242,8 +249,66 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     x: Math.round((1 - wrist.x) * w),
                     y: Math.round(wrist.y * h),
                 });
+
+                // Orientation from wrist (0) and middle MCP (9); MediaPipe gives x,y,z (z = relative depth)
+                const middle = landmarks[9];
+                const dx = middle.x - wrist.x;
+                const dy = middle.y - wrist.y;
+                const dz = (middle.z ?? 0) - (wrist.z ?? 0);
+                const toDeg = (rad: number) => (rad * 180) / Math.PI;
+                // Rotation (roll): in-screen angle of wrist→middle line (mirrored so hand-right = right)
+                const rotation = toDeg(Math.atan2(dy, wrist.x - middle.x));
+                // Yaw: hand turning left/right (x-z plane)
+                const yaw = toDeg(Math.atan2(dz, dx));
+                // Tilt: hand tilting forward/back (y-z plane)
+                const tilt = toDeg(Math.atan2(dy, Math.hypot(dx, dz) || 1e-6));
+                setOrientation({ rotation, yaw, tilt });
+
+                // Crosshair: ray origin = hand position (x, y, z); z is hand's z (assumed distance if missing); direction from orientation; intersect with screen plane z=0
+                const toRad = (deg: number) => (deg * Math.PI) / 180;
+                const rotRad = toRad(rotation);
+                const tiltRad = toRad(tilt);
+                const cosTilt = Math.cos(tiltRad);
+                const sinTilt = Math.sin(tiltRad);
+                const dirX = Math.cos(rotRad) * cosTilt;
+                const dirY = Math.sin(rotRad) * cosTilt;
+                const dirZ = sinTilt;
+                // Ray origin: hand position; z = hand's z (assumed distance where the person puts their hand, if missing)
+                const ox = wrist.x;
+                const oy = wrist.y;
+                const oz = ASSUMED_HAND_DISTANCE_Z;
+                // Intersect ray origin + t * dir with plane z = 0
+                let crosshairNormX: number;
+                let crosshairNormY: number;
+                if (Math.abs(dirZ) > 1e-4) {
+                    const t = (0 - oz) / dirZ;
+                    crosshairNormX = ox + t * dirX;
+                    crosshairNormY = oy + t * dirY;
+                } else {
+                    // Line parallel to screen: extend in xy only by fixed amount
+                    const scale = 0.2;
+                    const len = Math.hypot(dirX, dirY) || 1e-6;
+                    crosshairNormX = ox + (dirX / len) * scale;
+                    crosshairNormY = oy + (dirY / len) * scale;
+                }
+                const cx = Math.max(0, Math.min(w, crosshairNormX * w));
+                const cy = Math.max(0, Math.min(h, crosshairNormY * h));
+                setCrosshair({ x: Math.round(cx), y: Math.round(cy) });
+
+                // Draw crosshair on canvas (mirrored coords: cx already in canvas space)
+                const half = CROSSHAIR_SIZE / 2;
+                ctx.strokeStyle = "rgba(255, 255, 0, 0.95)";
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.moveTo(cx - half, cy);
+                ctx.lineTo(cx + half, cy);
+                ctx.moveTo(cx, cy - half);
+                ctx.lineTo(cx, cy + half);
+                ctx.stroke();
             } else {
                 setPosition(null);
+                setOrientation(null);
+                setCrosshair(null);
             }
 
             ctx.restore();
@@ -352,6 +417,12 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 </button>
                 <span className="font-display text-sm tracking-wider text-white/70">
                     {position != null ? `X: ${position.x}  Y: ${position.y}` : "X: —  Y: —"}
+                    {orientation != null && (
+                        <>  ·  R: {Math.round(orientation.rotation)}°  Y: {Math.round(orientation.yaw)}°  T: {Math.round(orientation.tilt)}°</>
+                    )}
+                    {crosshair != null && (
+                        <>  ·  Crosshair: {crosshair.x}, {crosshair.y}</>
+                    )}
                 </span>
                 <span className="font-display text-sm tracking-wider text-white/90">
                     SCORE: 0
