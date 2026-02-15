@@ -58,8 +58,7 @@ const SongListPage = ({ onBack, onSelectSong }: SongListPageProps) => {
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                const audio = new Audio(fullUrl);
-                audio.play();
+                onSelectSong(fullUrl);
               }}
               className="px-2 py-1 bg-primary text-primary-foreground rounded-md text-sm"
             >
