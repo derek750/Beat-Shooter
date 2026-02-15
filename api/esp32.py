@@ -29,6 +29,7 @@ _events_lock = threading.Lock()
 
 _reader: Optional[threading.Thread] = None
 
+CONSTANT_PORT = "/dev/cu.ESP32_Controller"
 
 def _parse_line(line: str) -> Optional[tuple[list[int] | None, float | None, float | None]]:
     """Parse a line from ESP32 into (button_states, pitch_deg, roll_deg). Any can be None."""
@@ -107,7 +108,6 @@ class ConnectBody(BaseModel):
     port: str
     baud_rate: int = 115200
 
-
 @router.get("/ports")
 def list_ports():
     """List available serial ports (e.g. USB connection to ESP32)."""
@@ -134,18 +134,18 @@ def connect(body: ConnectBody):
             }
         try:
             conn = serial.Serial(
-                port=body.port,
+                port=CONSTANT_PORT,
                 baudrate=body.baud_rate,
                 timeout=0.1,
             )
             _serial_conn = conn
-            _connected_port = body.port
+            _connected_port = CONSTANT_PORT
             _baud_rate = body.baud_rate
         except serial.SerialException as e:
             raise HTTPException(status_code=400, detail=str(e))
     _reader = threading.Thread(target=_reader_thread, daemon=True)
     _reader.start()
-    return {"success": True, "port": body.port, "baud_rate": body.baud_rate}
+    return {"success": True, "port": CONSTANT_PORT, "baud_rate": body.baud_rate}
 
 
 @router.post("/disconnect")
