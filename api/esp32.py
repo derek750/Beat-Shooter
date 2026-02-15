@@ -1,7 +1,11 @@
+import atexit
 import asyncio
 import json
+import os
 import re
+import signal
 import threading
+import time
 from typing import Optional
 
 import serial
@@ -31,6 +35,45 @@ _events_lock = threading.Lock()
 _reader: Optional[threading.Thread] = None
 
 CONSTANT_PORT = "/dev/cu.ESP32_Controller"
+
+
+def _close_serial_safely(conn: serial.Serial) -> None:
+    """Close serial connection with flush and delays. Required for Bluetooth SPP on macOS
+    to avoid the port/device getting stuck and requiring forget/re-pair."""
+    if conn is None or not conn.is_open:
+        return
+    try:
+        time.sleep(0.15)
+        conn.reset_input_buffer()
+        conn.reset_output_buffer()
+        time.sleep(0.15)
+        # Lower DTR/RTS before close - helps Bluetooth SPP release cleanly
+        try:
+            conn.dtr = False
+            conn.rts = False
+            time.sleep(0.1)
+        except Exception:
+            pass
+        conn.close()
+        time.sleep(0.1)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _shutdown_serial() -> None:
+    """Disconnect and close serial on process exit. Called by atexit and signal handlers."""
+    global _serial_conn, _connected_port, _reader
+    conn = None
+    with _serial_lock:
+        conn = _serial_conn
+        _serial_conn = None
+        _connected_port = None
+    if conn is not None:
+        _close_serial_safely(conn)
+
 
 def _parse_line(line: str) -> Optional[tuple[list[int] | None, float | None, float | None]]:
     """Parse a line from ESP32 into (button_states, pitch_deg, roll_deg). Any can be None."""
@@ -157,15 +200,13 @@ def connect(body: ConnectBody):
 def disconnect():
     """Disconnect from the ESP32."""
     global _serial_conn, _connected_port
+    conn = None
     with _serial_lock:
         conn = _serial_conn
         _serial_conn = None
         _connected_port = None
-    if conn is not None and conn.is_open:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    if conn is not None:
+        _close_serial_safely(conn)
     return {"success": True, "detail": "Disconnected"}
 
 
@@ -229,3 +270,23 @@ def get_accelerometer():
         pitch = _pitch
         roll = _roll
     return {"pitch": pitch, "roll": roll}
+
+
+# Ensure Bluetooth serial is properly closed when the server exits (Ctrl+C, kill, etc.).
+# Without this, macOS can leave the port in a stuck state requiring forget/re-pair.
+atexit.register(_shutdown_serial)
+
+
+def _signal_handler(signum, frame):
+    _shutdown_serial()
+    # Restore default handler and re-raise so process exits normally
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+try:
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+except (ValueError, OSError):
+    # Can happen in non-main thread or unsupported platform
+    pass
