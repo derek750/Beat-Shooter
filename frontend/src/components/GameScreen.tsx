@@ -7,6 +7,7 @@ interface GameScreenProps {
 }
 
 const API_BASE = "http://localhost:8000";
+const WS_BASE = API_BASE.replace(/^http/, "ws");
 const TILE_RADIUS = 70;
 /** Tiles within this many before/after cannot overlap (passed to API). */
 const TILE_WINDOW = 6;
@@ -33,6 +34,9 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const [countdown, setCountdown] = useState<number | null>(null);
     const [showEndScreen, setShowEndScreen] = useState(false);
     const [score] = useState(0); // TODO: implement scoring logic
+    /** Latest ESP32 button event from WebSocket (PRESS/RELEASE + button index). Consumed by game logic. */
+    const [esp32ButtonEvent, setEsp32ButtonEvent] = useState<{ type: "PRESS" | "RELEASE"; button: number } | null>(null);
+    const wsRef = useRef<WebSocket | null>(null);
     const tilesRef = useRef<Tile[]>([]);
     /** Seconds after audio start when each tile should appear (from beat map). */
     const tileDisplayTimesRef = useRef<number[]>([]);
@@ -64,6 +68,44 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         const runBeforeCountdown = async () => {
             const width = window.innerWidth;
             const height = window.innerHeight - 60;
+
+            // Connect to ESP32 before we use the WebSocket for button events
+            try {
+                const connectRes = await fetch(`${API_BASE}/esp32/connect`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ port: "/dev/cu.ESP32_Controller", baud_rate: 115200 }),
+                });
+                const connectData = (await connectRes.json()) as { success?: boolean };
+                if (!connectData.success) {
+                    console.warn("ESP32 connect failed or already connected:", await connectRes.text());
+                }
+            } catch (e) {
+                console.warn("ESP32 connect error:", e);
+            }
+            if (cancelled) return;
+
+            // Open WebSocket for ESP32 button events (only after connect)
+            const wsUrl = `${WS_BASE}/esp32/ws`;
+            const ws = new WebSocket(wsUrl);
+            wsRef.current = ws;
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data) as { type?: string; button?: number };
+                    if (data?.type !== "PRESS" && data?.type !== "RELEASE") return;
+                    const buttonIndex = typeof data.button === "number" ? data.button : 0;
+                    if (buttonIndex !== 0 && buttonIndex !== 1) return;
+                    if (data.type === "PRESS") {
+                        console.log(`Button [${buttonIndex}] clicked`);
+                    }
+                    setEsp32ButtonEvent({ type: data.type as "PRESS" | "RELEASE", button: buttonIndex });
+                } catch {
+                    // ignore parse errors
+                }
+            };
+            ws.onclose = () => {
+                wsRef.current = null;
+            };
 
             const beatMapRes = await fetch(`${API_BASE}/beats/create_beats`, {
                 method: "POST",
@@ -131,6 +173,10 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
 
         return () => {
             cancelled = true;
+            if (wsRef.current) {
+                wsRef.current.close();
+                wsRef.current = null;
+            }
             if (countdownIntervalRef.current) {
                 clearInterval(countdownIntervalRef.current);
                 countdownIntervalRef.current = null;
@@ -376,6 +422,11 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 </button>
                 <span className="font-display text-sm tracking-wider text-white/70">
                     {position != null ? `X: ${position.x}  Y: ${position.y}` : "X: —  Y: —"}
+                    {esp32ButtonEvent != null && (
+                        <span className="ml-3 text-emerald-400">
+                            ESP32: {esp32ButtonEvent.type} {esp32ButtonEvent.button}
+                        </span>
+                    )}
                 </span>
                 <span className="font-display text-sm tracking-wider text-white/90">
                     SCORE: {score}

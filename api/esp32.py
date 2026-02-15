@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import threading
@@ -5,7 +6,7 @@ from typing import Optional
 
 import serial
 import serial.tools.list_ports
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/esp32", tags=["esp32"])
@@ -58,6 +59,10 @@ def _parse_line(line: str) -> Optional[tuple[list[int] | None, float | None, flo
 
 
 def _emit_event(kind: str, index: int) -> None:
+    if index not in (0, 1):
+        return
+    if kind == "PRESS":
+        print(f"Button [{index}] clicked")
     with _events_lock:
         _events.append({"type": kind, "button": index})
         if len(_events) > _max_events:
@@ -194,6 +199,27 @@ def get_events(clear: bool = False):
         if clear:
             _events.clear()
     return {"events": out}
+
+
+@router.websocket("/ws")
+async def esp32_events_websocket(websocket: WebSocket):
+    """Stream ESP32 button press/release events in real time. Sends JSON: { "type": "PRESS"|"RELEASE", "button": index }."""
+    await websocket.accept()
+    try:
+        while True:
+            await asyncio.sleep(0.05)
+            with _events_lock:
+                out = list(_events)
+                _events.clear()
+            for ev in out:
+                try:
+                    await websocket.send_json(ev)
+                except Exception:
+                    return
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
 
 
 @router.get("/accelerometer")
