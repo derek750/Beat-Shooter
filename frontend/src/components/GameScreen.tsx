@@ -7,19 +7,25 @@ interface GameScreenProps {
 }
 
 const API_BASE = "http://localhost:8000";
+const WS_URL = "ws://localhost:8000/esp32/ws";
+
 const TILE_RADIUS = 70;
 /** Tiles within this many before/after cannot overlap (passed to API). */
 const TILE_WINDOW = 6;
 /** Minimum pixel distance between tiles in the window (passed to API). */
 const TILE_SPACING_RADIUS = 2 * TILE_RADIUS;
-const TILE_FADE_IN_DURATION = 0.05; // quick pop so circle appears right when beat hits
-const TILE_FADE_OUT_DURATION = 0.4; // constant time to fade out
-const TILE_VISIBLE_DURATION = 4; // full opacity before fade out
-const ENERGY_RADIUS_SCALE = 0.6; // higher energy = up to 60% bigger
+const TILE_FADE_IN_DURATION = 0.05;
+const TILE_FADE_OUT_DURATION = 0.4;
+const TILE_VISIBLE_DURATION = 4;
+const ENERGY_RADIUS_SCALE = 0.6;
 const TILE_BASE_OPACITY = 0.82;
-const END_SCREEN_DELAY = 3; // seconds after last tile to show end screen
+const END_SCREEN_DELAY = 3;
 
 type Tile = { x: number; y: number };
+type Esp32Event =
+    | { type: "PRESS" | "RELEASE"; button: number }
+    | { type: "STATE"; buttons: number[] }
+    | { type: string; [k: string]: any };
 
 const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const videoRef = useRef<HTMLVideoElement>(null);
@@ -32,25 +38,99 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const [countdown, setCountdown] = useState<number | null>(null);
     const [showEndScreen, setShowEndScreen] = useState(false);
-    const [score] = useState(0); // TODO: implement scoring logic
+
+    // ✅ make score real so you can SEE button working immediately
+    const [score, setScore] = useState(0);
+
     const tilesRef = useRef<Tile[]>([]);
-    /** Seconds after audio start when each tile should appear (from beat map). */
     const tileDisplayTimesRef = useRef<number[]>([]);
-    /** Beat point types from beat map ('low' | 'high'), same length as beat timestamps. */
     const beatTypesRef = useRef<string[]>([]);
-    /** Energy values per beat (for circle size scaling), same length as timestamps. */
     const energiesRef = useRef<number[]>([]);
     const countdownRef = useRef<number | null>(null);
     const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const gameStartTimeRef = useRef<number | null>(null);
     const gameEndTimeRef = useRef<number | null>(null);
+
+    // ✅ hardware / esp32
+    const wsRef = useRef<WebSocket | null>(null);
+    const lastPressAtRef = useRef<number>(0);
+    const [hardwareConnected, setHardwareConnected] = useState(false);
+
     countdownRef.current = countdown;
+
+    // ----------------------------
+    // ESP32 WebSocket listener
+    // ----------------------------
+    useEffect(() => {
+        const ws = new WebSocket(WS_URL);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+            setHardwareConnected(true);
+            // keepalive ping every 10s so server loop stays alive
+            const ping = setInterval(() => {
+                try {
+                    if (ws.readyState === WebSocket.OPEN) ws.send("ping");
+                } catch {}
+            }, 10000);
+
+            (ws as any)._pingInterval = ping;
+        };
+
+        ws.onclose = () => {
+            setHardwareConnected(false);
+            const ping = (ws as any)._pingInterval as ReturnType<typeof setInterval> | undefined;
+            if (ping) clearInterval(ping);
+        };
+
+        ws.onerror = () => {
+            // onclose will handle state
+        };
+
+        ws.onmessage = (msg) => {
+            let evt: Esp32Event | null = null;
+            try {
+                evt = JSON.parse(msg.data);
+            } catch {
+                return;
+            }
+            if (!evt) return;
+
+            // Example: button 0 PRESS = "shoot"
+            if (evt.type === "PRESS" && typeof (evt as any).button === "number") {
+                const button = (evt as any).button as number;
+
+                // simple debounce so holding the button doesn't spam
+                const now = performance.now();
+                if (now - lastPressAtRef.current < 80) return;
+                lastPressAtRef.current = now;
+
+                if (button === 0) {
+                    // ✅ "does something in the app" — visible proof
+                    setScore((s) => s + 1);
+                }
+
+                // you can map other buttons here:
+                // if (button === 1) pause, if (button === 2) back, etc.
+            }
+        };
+
+        return () => {
+            try {
+                const ping = (ws as any)._pingInterval as ReturnType<typeof setInterval> | undefined;
+                if (ping) clearInterval(ping);
+                ws.close();
+            } catch {}
+            wsRef.current = null;
+        };
+    }, []);
 
     // Before countdown: fetch tiles + placeholder API, then 5-second countdown
     useEffect(() => {
         if (!audioUrl) {
             setCountdown(null);
             setShowEndScreen(false);
+            setScore(0);
             tilesRef.current = [];
             tileDisplayTimesRef.current = [];
             beatTypesRef.current = [];
@@ -74,9 +154,11 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
             if (!beatMapRes.ok) {
                 console.warn("Beat map failed, using placeholder times:", await beatMapRes.text());
             }
+
             const beatMap = beatMapRes.ok
                 ? (await beatMapRes.json()) as { timestamps: number[]; types: string[]; all_points?: { energy: number }[]; duration?: number }
                 : { timestamps: [] as number[], types: [] as string[], all_points: [] };
+
             const beatTimestamps = beatMap.timestamps ?? [];
             beatTypesRef.current = beatMap.types ?? [];
             energiesRef.current = (beatMap.all_points ?? []).map((p) => p.energy ?? 0);
@@ -94,18 +176,19 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 }),
             });
             if (cancelled) return;
+
             const tilesData = await tilesRes.json();
             const tiles: Tile[] = (tilesData.x as number[]).map((x: number, i: number) => ({
                 x: x / width,
                 y: (tilesData.y as number[])[i] / height,
             }));
+
             tilesRef.current = tiles;
             tileDisplayTimesRef.current =
                 beatTimestamps.length > 0
                     ? [...beatTimestamps]
                     : Array.from({ length: count }, (_, i) => i * 0.5);
 
-            // Calculate when game should end (last tile + all durations + delay)
             if (tileDisplayTimesRef.current.length > 0) {
                 const lastTileTime = Math.max(...tileDisplayTimesRef.current);
                 const lastTileEndTime = lastTileTime + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION + TILE_FADE_OUT_DURATION;
@@ -113,6 +196,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
             }
 
             if (cancelled) return;
+
             setCountdown(5);
             const interval = setInterval(() => {
                 setCountdown((prev) => {
@@ -124,6 +208,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     return prev - 1;
                 });
             }, 1000);
+
             countdownIntervalRef.current = interval;
         };
 
@@ -140,12 +225,15 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
 
     useEffect(() => {
         if (!audioUrl || countdown !== 0) return;
+
         gameStartTimeRef.current = performance.now();
         setShowEndScreen(false);
+
         const audio = new Audio(audioUrl);
         audio.loop = false;
         audioRef.current = audio;
         audio.play().catch((err) => console.warn("Audio autoplay failed:", err));
+
         return () => {
             audio.pause();
             audioRef.current = null;
@@ -162,7 +250,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         });
 
         hands.setOptions({
-            maxNumHands: 1, // Only track one hand for lane detection
+            maxNumHands: 1,
             modelComplexity: 1,
             minDetectionConfidence: 0.5,
             minTrackingConfidence: 0.5,
@@ -175,18 +263,16 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
             const ctx = canvas.getContext("2d");
             if (!ctx) return;
 
-            // Clear canvas
             ctx.save();
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
             const { width: w, height: h } = canvas;
+
             if (countdownRef.current === 0 && tilesRef.current.length > 0 && gameStartTimeRef.current != null) {
                 const elapsed = (performance.now() - gameStartTimeRef.current) / 1000;
-                
-                // Check if game should end
+
                 if (gameEndTimeRef.current != null && elapsed >= gameEndTimeRef.current && !showEndScreen) {
                     setShowEndScreen(true);
-                    // Stop audio
                     if (audioRef.current) {
                         audioRef.current.pause();
                     }
@@ -196,14 +282,18 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 const tiles = tilesRef.current;
                 const beatTypes = beatTypesRef.current;
                 const energies = energiesRef.current;
+
                 const minE = energies.length > 0 ? Math.min(...energies) : 0;
                 const maxE = energies.length > 0 ? Math.max(...energies) : 1;
                 const energyRange = maxE - minE || 1;
+
                 for (let i = 0; i < tiles.length; i++) {
                     const displayAt = times[i] ?? 0;
                     if (elapsed < displayAt) continue;
+
                     const fadeOutStart = displayAt + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION;
-                    if (elapsed >= fadeOutStart + TILE_FADE_OUT_DURATION) continue; // done, don't draw
+                    if (elapsed >= fadeOutStart + TILE_FADE_OUT_DURATION) continue;
+
                     let opacity: number;
                     if (elapsed < displayAt + TILE_FADE_IN_DURATION) {
                         const fadeProgress = (elapsed - displayAt) / TILE_FADE_IN_DURATION;
@@ -214,6 +304,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     } else {
                         opacity = TILE_BASE_OPACITY;
                     }
+
                     const cx = (1 - tiles[i].x) * w;
                     const cy = tiles[i].y * h;
 
@@ -236,12 +327,10 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 }
             }
 
-            // Draw bounding box around hand
             if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
                 const landmarks = results.multiHandLandmarks[0];
                 const { width: w, height: h } = canvas;
 
-                // Bounding box from landmarks (x inverted for mirrored display)
                 let minX = 1, maxX = 0, minY = 1, maxY = 0;
                 for (const lm of landmarks) {
                     const x = 1 - lm.x;
@@ -250,6 +339,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     minY = Math.min(minY, lm.y);
                     maxY = Math.max(maxY, lm.y);
                 }
+
                 const pad = 0.03;
                 const left = (minX - pad) * w;
                 const top = (minY - pad) * h;
@@ -260,7 +350,6 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 ctx.lineWidth = 4;
                 ctx.strokeRect(w - left - boxW, top, boxW, boxH);
 
-                // Wrist (landmark 0) position
                 const wrist = landmarks[0];
                 setPosition({
                     x: Math.round((1 - wrist.x) * w),
@@ -315,8 +404,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 activeStream = mediaStream;
                 setStream(mediaStream);
             } catch (err) {
-                const message =
-                    err instanceof Error ? err.message : "Could not access camera";
+                const message = err instanceof Error ? err.message : "Could not access camera";
                 if (err instanceof Error && err.name === "NotAllowedError") {
                     setError("Camera access was denied. Allow camera in your browser to play.");
                 } else if (err instanceof Error && err.name === "NotFoundError") {
@@ -342,7 +430,6 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         if (!videoRef.current || !stream) return;
         videoRef.current.srcObject = stream;
 
-        // Set canvas size to match video element's rendered dimensions
         const updateCanvasSize = () => {
             if (videoRef.current && canvasRef.current) {
                 const rect = videoRef.current.getBoundingClientRect();
@@ -366,7 +453,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
 
     return (
         <div className="relative h-screen w-screen bg-background overflow-hidden flex flex-col">
-            {/* Top bar: no video, fixed height */}
+            {/* Top bar */}
             <div className="flex-shrink-0 flex items-center justify-between px-4 py-3 bg-black/90 z-10">
                 <button
                     onClick={onBack}
@@ -374,15 +461,21 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 >
                     ← BACK
                 </button>
+
                 <span className="font-display text-sm tracking-wider text-white/70">
                     {position != null ? `X: ${position.x}  Y: ${position.y}` : "X: —  Y: —"}
                 </span>
+
+                <span className="font-display text-sm tracking-wider text-white/70">
+                    HW: {hardwareConnected ? "CONNECTED" : "OFFLINE"}
+                </span>
+
                 <span className="font-display text-sm tracking-wider text-white/90">
                     SCORE: {score}
                 </span>
             </div>
 
-            {/* Video/canvas area only below the bar, mirrored so hand-right = right */}
+            {/* Video/canvas area */}
             <div className="flex-1 min-h-0 bg-card flex items-center justify-center overflow-hidden relative">
                 {countdown != null && countdown > 0 && (
                     <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/70">
