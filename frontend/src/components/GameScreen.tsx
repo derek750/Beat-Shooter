@@ -17,6 +17,8 @@ const TILE_VISIBLE_DURATION = 4; // full opacity before fade out
 const ENERGY_RADIUS_SCALE = 0.6; // higher energy = up to 60% bigger
 const TILE_BASE_OPACITY = 0.82;
 const END_SCREEN_DELAY = 3; // seconds after last tile to show end screen
+const HIT_CONTACT_DURATION = 0.5; // seconds of contact needed to hit a tile
+const HIT_FADE_OUT_DURATION = 0.3; // quick fade when hit
 
 type Tile = { x: number; y: number };
 
@@ -40,7 +42,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const [countdown, setCountdown] = useState<number | null>(null);
     const [showEndScreen, setShowEndScreen] = useState(false);
-    const [score] = useState(0); // TODO: implement scoring logic
+    const [score, setScore] = useState(0);
     const tilesRef = useRef<Tile[]>([]);
     /** Seconds after audio start when each tile should appear (from beat map). */
     const tileDisplayTimesRef = useRef<number[]>([]);
@@ -48,6 +50,12 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const beatTypesRef = useRef<string[]>([]);
     /** Energy values per beat (for circle size scaling), same length as timestamps. */
     const energiesRef = useRef<number[]>([]);
+    /** Track which tiles have been hit */
+    const tileHitStatesRef = useRef<boolean[]>([]);
+    /** Track when contact started with each tile (null if no contact) */
+    const tileContactStartRef = useRef<(number | null)[]>([]);
+    /** Track when each tile was hit (for fade out animation) */
+    const tileHitTimesRef = useRef<(number | null)[]>([]);
     const countdownRef = useRef<number | null>(null);
     const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const gameStartTimeRef = useRef<number | null>(null);
@@ -60,10 +68,15 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         if (!audioUrl) {
             setCountdown(null);
             setShowEndScreen(false);
+            setScore(0);
             tilesRef.current = [];
             tileDisplayTimesRef.current = [];
             beatTypesRef.current = [];
             energiesRef.current = [];
+            tileHitStatesRef.current = [];
+            tileContactStartRef.current = [];
+            tileHitTimesRef.current = [];
+            gameEndTimeRef.current = null;
             gameEndTimeRef.current = null;
             endScreenShownRef.current = false;
             return;
@@ -114,6 +127,11 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 beatTimestamps.length > 0
                     ? [...beatTimestamps]
                     : Array.from({ length: count }, (_, i) => i * 0.5);
+
+            // Initialize hit tracking arrays
+            tileHitStatesRef.current = new Array(tiles.length).fill(false);
+            tileContactStartRef.current = new Array(tiles.length).fill(null);
+            tileHitTimesRef.current = new Array(tiles.length).fill(null);
 
             // Calculate when game should end (last tile + all durations + delay)
             if (tileDisplayTimesRef.current.length > 0) {
@@ -180,13 +198,24 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
             const h = c.height;
             ctx.clearRect(0, 0, w, h);
 
+            const cvResult = cvResultRef.current;
+            const cvBox = cvResult
+                ? {
+                    left: cvResult.bbox[0],
+                    top: cvResult.bbox[1],
+                    right: cvResult.bbox[0] + cvResult.bbox[2],
+                    bottom: cvResult.bbox[1] + cvResult.bbox[3],
+                }
+                : null;
+
             if (countdownRef.current === 0 && tilesRef.current.length > 0 && gameStartTimeRef.current != null) {
                 const elapsed = (performance.now() - gameStartTimeRef.current) / 1000;
-
+                
                 // Check if game should end
                 if (gameEndTimeRef.current != null && elapsed >= gameEndTimeRef.current && !endScreenShownRef.current) {
                     endScreenShownRef.current = true;
                     setShowEndScreen(true);
+                    // Stop audio
                     if (audioRef.current) {
                         audioRef.current.pause();
                     }
@@ -199,25 +228,78 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 const minE = energies.length > 0 ? Math.min(...energies) : 0;
                 const maxE = energies.length > 0 ? Math.max(...energies) : 1;
                 const energyRange = maxE - minE || 1;
+                
                 for (let i = 0; i < tiles.length; i++) {
                     const displayAt = times[i] ?? 0;
                     if (elapsed < displayAt) continue;
-                    const fadeOutStart = displayAt + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION;
-                    if (elapsed >= fadeOutStart + TILE_FADE_OUT_DURATION) continue;
-                    let opacity: number;
-                    if (elapsed < displayAt + TILE_FADE_IN_DURATION) {
-                        const fadeProgress = (elapsed - displayAt) / TILE_FADE_IN_DURATION;
-                        opacity = TILE_BASE_OPACITY * fadeProgress;
-                    } else if (elapsed >= fadeOutStart) {
-                        const fadeOutProgress = (elapsed - fadeOutStart) / TILE_FADE_OUT_DURATION;
-                        opacity = TILE_BASE_OPACITY * (1 - Math.min(1, fadeOutProgress));
-                    } else {
-                        opacity = TILE_BASE_OPACITY;
-                    }
-                    const cx = (1 - tiles[i].x) * w;
-                    const cy = tiles[i].y * h;
+                    
                     const energyNorm = energies[i] != null ? (energies[i] - minE) / energyRange : 0.5;
                     const radius = TILE_RADIUS * (1 + energyNorm * ENERGY_RADIUS_SCALE);
+                    const cx = (1 - tiles[i].x) * w;
+                    const cy = tiles[i].y * h;
+                    
+                    // Check collision with CV-tracked object (colour/bbox) if tile is visible and not yet hit
+                    if (!tileHitStatesRef.current[i] && cvBox) {
+                        const tileLeft = cx - radius;
+                        const tileRight = cx + radius;
+                        const tileTop = cy - radius;
+                        const tileBottom = cy + radius;
+                        
+                        // Check if CV bbox overlaps with tile circle (using bounding box collision)
+                        const isColliding = !(
+                            cvBox.right < tileLeft ||
+                            cvBox.left > tileRight ||
+                            cvBox.bottom < tileTop ||
+                            cvBox.top > tileBottom
+                        );
+                        
+                        if (isColliding) {
+                            // Start or continue contact
+                            if (tileContactStartRef.current[i] === null) {
+                                tileContactStartRef.current[i] = elapsed;
+                            } else {
+                                // Check if contact duration met
+                                const contactDuration = elapsed - tileContactStartRef.current[i];
+                                if (contactDuration >= HIT_CONTACT_DURATION) {
+                                    tileHitStatesRef.current[i] = true;
+                                    tileHitTimesRef.current[i] = elapsed;
+                                    tileContactStartRef.current[i] = null;
+                                    setScore(prev => prev + 1);
+                                }
+                            }
+                        } else {
+                            // No collision, reset contact
+                            tileContactStartRef.current[i] = null;
+                        }
+                    }
+                    
+                    // Calculate opacity based on hit state or normal lifecycle
+                    let opacity: number;
+                    const isHit = tileHitStatesRef.current[i];
+                    
+                    if (isHit) {
+                        // Hit tile - fade out quickly
+                        const hitTime = tileHitTimesRef.current[i] ?? elapsed;
+                        const timeSinceHit = elapsed - hitTime;
+                        if (timeSinceHit >= HIT_FADE_OUT_DURATION) continue; // Don't draw
+                        const fadeProgress = timeSinceHit / HIT_FADE_OUT_DURATION;
+                        opacity = TILE_BASE_OPACITY * (1 - fadeProgress);
+                    } else {
+                        // Normal lifecycle
+                        const fadeOutStart = displayAt + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION;
+                        if (elapsed >= fadeOutStart + TILE_FADE_OUT_DURATION) continue; // done, don't draw
+                        
+                        if (elapsed < displayAt + TILE_FADE_IN_DURATION) {
+                            const fadeProgress = (elapsed - displayAt) / TILE_FADE_IN_DURATION;
+                            opacity = TILE_BASE_OPACITY * fadeProgress;
+                        } else if (elapsed >= fadeOutStart) {
+                            const fadeOutProgress = (elapsed - fadeOutStart) / TILE_FADE_OUT_DURATION;
+                            opacity = TILE_BASE_OPACITY * (1 - Math.min(1, fadeOutProgress));
+                        } else {
+                            opacity = TILE_BASE_OPACITY;
+                        }
+                    }
+                    
                     const isHigh = beatTypes[i] === "high";
                     const fillColor = isHigh ? "rgba(239, 68, 68, 0.88)" : "rgba(99, 102, 241, 0.88)";
                     ctx.save();
@@ -233,7 +315,6 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 }
             }
 
-            const cvResult = cvResultRef.current;
             if (cvResult) {
                 const [bx, by, bw, bh] = cvResult.bbox;
                 // Invert bbox x coordinate
@@ -283,7 +364,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         return () => {
             if (animationFrame) cancelAnimationFrame(animationFrame);
         };
-    }, [stream]);
+    }, [stream, showEndScreen]);
 
     // Capture video frames and send to CV API for colour tracking
     useEffect(() => {
