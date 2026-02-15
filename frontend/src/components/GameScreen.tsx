@@ -18,6 +18,8 @@ const TILE_VISIBLE_DURATION = 2; // full opacity before fade out
 const ENERGY_RADIUS_SCALE = 0.6; // higher energy = up to 60% bigger
 const TILE_BASE_OPACITY = 0.82;
 const END_SCREEN_DELAY = 3; // seconds after last tile to show end screen
+/** Duration of the "shot" burst effect when a tile is hit */
+const HIT_EFFECT_DURATION = 0.35;
 
 type Tile = { x: number; y: number };
 
@@ -317,9 +319,37 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     // Calculate opacity based on hit state or normal lifecycle
                     let opacity: number;
                     const isHit = tileHitStatesRef.current[i];
+                    const hitTime = tileHitTimesRef.current[i];
                     
                     if (isHit) {
-                        // Hit tile - disappear immediately (don't draw)
+                        // Hit tile - play shot effect then stop drawing
+                        if (hitTime != null) {
+                            const effectElapsed = elapsed - hitTime;
+                            if (effectElapsed < HIT_EFFECT_DURATION) {
+                                const t = effectElapsed / HIT_EFFECT_DURATION;
+                                const burstRadius = radius * (1 + t * 1.2);
+                                const burstOpacity = (1 - t) * 0.9;
+                                const isHigh = beatTypes[i] === "high";
+                                const burstColor = isHigh ? "rgba(239, 68, 68," : "rgba(99, 102, 241,";
+                                ctx.save();
+                                // Expanding ring
+                                ctx.strokeStyle = burstColor + burstOpacity + ")";
+                                ctx.lineWidth = 4;
+                                ctx.globalAlpha = 1;
+                                ctx.beginPath();
+                                ctx.arc(cx, cy, burstRadius, 0, Math.PI * 2);
+                                ctx.stroke();
+                                // Brief bright center flash
+                                const flashOpacity = (1 - t * 2) * 0.85;
+                                if (flashOpacity > 0) {
+                                    ctx.fillStyle = "rgba(255, 255, 255, " + flashOpacity + ")";
+                                    ctx.beginPath();
+                                    ctx.arc(cx, cy, radius * 0.4, 0, Math.PI * 2);
+                                    ctx.fill();
+                                }
+                                ctx.restore();
+                            }
+                        }
                         continue;
                     } else {
                         // Normal lifecycle
