@@ -17,6 +17,7 @@ const TILE_FADE_OUT_DURATION = 0.4; // constant time to fade out
 const TILE_VISIBLE_DURATION = 4; // full opacity before fade out
 const ENERGY_RADIUS_SCALE = 0.6; // higher energy = up to 60% bigger
 const TILE_BASE_OPACITY = 0.82;
+const END_SCREEN_DELAY = 3; // seconds after last tile to show end screen
 
 type Tile = { x: number; y: number };
 
@@ -30,6 +31,8 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const handsRef = useRef<Hands | null>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const [countdown, setCountdown] = useState<number | null>(null);
+    const [showEndScreen, setShowEndScreen] = useState(false);
+    const [score] = useState(0); // TODO: implement scoring logic
     const tilesRef = useRef<Tile[]>([]);
     /** Seconds after audio start when each tile should appear (from beat map). */
     const tileDisplayTimesRef = useRef<number[]>([]);
@@ -40,16 +43,19 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     const countdownRef = useRef<number | null>(null);
     const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const gameStartTimeRef = useRef<number | null>(null);
+    const gameEndTimeRef = useRef<number | null>(null);
     countdownRef.current = countdown;
 
     // Before countdown: fetch tiles + placeholder API, then 5-second countdown
     useEffect(() => {
         if (!audioUrl) {
             setCountdown(null);
+            setShowEndScreen(false);
             tilesRef.current = [];
             tileDisplayTimesRef.current = [];
             beatTypesRef.current = [];
             energiesRef.current = [];
+            gameEndTimeRef.current = null;
             return;
         }
 
@@ -99,6 +105,13 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     ? [...beatTimestamps]
                     : Array.from({ length: count }, (_, i) => i * 0.5);
 
+            // Calculate when game should end (last tile + all durations + delay)
+            if (tileDisplayTimesRef.current.length > 0) {
+                const lastTileTime = Math.max(...tileDisplayTimesRef.current);
+                const lastTileEndTime = lastTileTime + TILE_FADE_IN_DURATION + TILE_VISIBLE_DURATION + TILE_FADE_OUT_DURATION;
+                gameEndTimeRef.current = lastTileEndTime + END_SCREEN_DELAY;
+            }
+
             if (cancelled) return;
             setCountdown(5);
             const interval = setInterval(() => {
@@ -128,8 +141,9 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
     useEffect(() => {
         if (!audioUrl || countdown !== 0) return;
         gameStartTimeRef.current = performance.now();
+        setShowEndScreen(false);
         const audio = new Audio(audioUrl);
-        audio.loop = true;
+        audio.loop = false;
         audioRef.current = audio;
         audio.play().catch((err) => console.warn("Audio autoplay failed:", err));
         return () => {
@@ -168,6 +182,16 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
             const { width: w, height: h } = canvas;
             if (countdownRef.current === 0 && tilesRef.current.length > 0 && gameStartTimeRef.current != null) {
                 const elapsed = (performance.now() - gameStartTimeRef.current) / 1000;
+                
+                // Check if game should end
+                if (gameEndTimeRef.current != null && elapsed >= gameEndTimeRef.current && !showEndScreen) {
+                    setShowEndScreen(true);
+                    // Stop audio
+                    if (audioRef.current) {
+                        audioRef.current.pause();
+                    }
+                }
+
                 const times = tileDisplayTimesRef.current;
                 const tiles = tilesRef.current;
                 const beatTypes = beatTypesRef.current;
@@ -254,7 +278,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         return () => {
             hands.close();
         };
-    }, []);
+    }, [showEndScreen]);
 
     // Process video frames
     useEffect(() => {
@@ -354,7 +378,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                     {position != null ? `X: ${position.x}  Y: ${position.y}` : "X: —  Y: —"}
                 </span>
                 <span className="font-display text-sm tracking-wider text-white/90">
-                    SCORE: 0
+                    SCORE: {score}
                 </span>
             </div>
 
@@ -367,6 +391,32 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                         </span>
                     </div>
                 )}
+
+                {/* End Screen */}
+                {showEndScreen && (
+                    <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/95">
+                        <div className="text-center space-y-8">
+                            <h2 className="font-display text-5xl font-black text-white tracking-wider">
+                                GAME OVER
+                            </h2>
+                            <div className="space-y-2">
+                                <p className="font-display text-2xl text-white/70 tracking-widest">
+                                    YOUR SCORE
+                                </p>
+                                <p className="font-display text-8xl font-black text-white tabular-nums">
+                                    {score}
+                                </p>
+                            </div>
+                            <button
+                                onClick={onBack}
+                                className="px-8 py-4 bg-white text-black font-display text-lg tracking-widest font-bold hover:bg-white/90 transition-colors cursor-pointer"
+                            >
+                                PLAY AGAIN
+                            </button>
+                        </div>
+                    </div>
+                )}
+
                 {loading && (
                     <span className="text-muted-foreground font-display text-sm tracking-widest animate-pulse">
                         Requesting camera access…
