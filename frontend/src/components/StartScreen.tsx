@@ -70,12 +70,12 @@ const StartScreen = ({ onStart, onSavedSongs }: StartScreenProps) => {
             />
             <div className="relative z-10 flex flex-col items-center gap-6 animate-slide-up">
                 <h1 className="font-display text-5xl md:text-7xl font-black tracking-wider text-foreground text-center">
-                    PIANO
-                    <span className="block text-primary">TILES</span>
+                    BEAT
+                    <span className="block text-primary">SHOOTER</span>
                 </h1>
 
                 <p className="text-muted-foreground text-lg tracking-widest uppercase">
-                    Tap the black tiles
+                    Aim at the screen and pull the trigger
                 </p>
 
                 <div className="flex flex-col gap-4 mt-6 w-full max-w-sm">
