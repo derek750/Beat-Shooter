@@ -14,7 +14,7 @@ const TILE_WINDOW = 6;
 const TILE_SPACING_RADIUS = 2 * TILE_RADIUS;
 const TILE_FADE_IN_DURATION = 0.05; // quick pop so circle appears right when beat hits
 const TILE_FADE_OUT_DURATION = 0.4; // constant time to fade out
-const TILE_VISIBLE_DURATION = 4; // full opacity before fade out
+const TILE_VISIBLE_DURATION = 2; // full opacity before fade out
 const ENERGY_RADIUS_SCALE = 0.6; // higher energy = up to 60% bigger
 const TILE_BASE_OPACITY = 0.82;
 const END_SCREEN_DELAY = 3; // seconds after last tile to show end screen
@@ -264,7 +264,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         };
     }, [audioUrl, countdown, hitTilesUnderBbox]);
 
-    // Draw loop: tiles + CV bbox + crosshair at projected point
+    // Draw loop: tiles + CV bbox
     useEffect(() => {
         if (!canvasRef.current || !stream) return;
 
@@ -359,38 +359,6 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 ctx.strokeStyle = "#00FF00";
                 ctx.lineWidth = 4;
                 ctx.strokeRect(invBx, by, bw, bh);
-
-                // Draw crosshair at projected point if available
-                if (cvResult.projected_point) {
-                    const [px, py] = cvResult.projected_point;
-                    // Invert x-coordinate to match the mirrored video display
-                    const invPx = w - px;
-                    const crosshairSize = 20;
-                    const lineWidth = 2;
-
-                    ctx.strokeStyle = "#FF00FF";
-                    ctx.lineWidth = lineWidth;
-                    ctx.globalAlpha = 0.8;
-
-                    // Horizontal line
-                    ctx.beginPath();
-                    ctx.moveTo(invPx - crosshairSize, py);
-                    ctx.lineTo(invPx + crosshairSize, py);
-                    ctx.stroke();
-
-                    // Vertical line
-                    ctx.beginPath();
-                    ctx.moveTo(invPx, py - crosshairSize);
-                    ctx.lineTo(invPx, py + crosshairSize);
-                    ctx.stroke();
-
-                    // Center circle
-                    ctx.fillStyle = "#FF00FF";
-                    ctx.globalAlpha = 0.6;
-                    ctx.beginPath();
-                    ctx.arc(invPx, py, 4, 0, Math.PI * 2);
-                    ctx.fill();
-                }
             }
 
             animationFrame = requestAnimationFrame(draw);
