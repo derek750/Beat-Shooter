@@ -105,7 +105,7 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
                 if (now - lastPressAtRef.current < 80) return;
                 lastPressAtRef.current = now;
 
-                if (button === 0) {
+                if (button === 1) {
                     // ✅ "does something in the app" — visible proof
                     setScore((s) => s + 1);
                 }
@@ -142,6 +142,16 @@ const GameScreen = ({ audioUrl, onBack }: GameScreenProps) => {
         let cancelled = false;
 
         const runBeforeCountdown = async () => {
+
+             const gunRes = await fetch(`${API_BASE}/esp32/connect`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    port: "/dev/cu.ESP32_Controller",
+                    baud_rate:115200
+                }),
+            });
+
             const width = window.innerWidth;
             const height = window.innerHeight - 60;
 
